@@ -15,7 +15,7 @@ import (
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/encoding/sse"
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
-	"go.alis.build/adk/launchers/launcherutils"
+	"go.alis.build/adk/launchers/internal/launcherutils"
 	"google.golang.org/adk/agent"
 	"google.golang.org/adk/cmd/launcher"
 	weblauncher "google.golang.org/adk/cmd/launcher/web"

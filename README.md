@@ -8,9 +8,8 @@ Use this repository when you need extra capabilities beyond the core ADK launche
 
 | Package                            | CLI keyword | Purpose                                                                                                        |
 | ---------------------------------- | ----------- | -------------------------------------------------------------------------------------------------------------- |
-| [`agui`](./agui)                   | `agui`      | [AG-UI](https://docs.ag-ui.com) SSE endpoint for CopilotKit and other AG-UI clients                            |
-| [`lro`](./lro)                     | `lro`       | HTTP resume routes for [go.alis.build/lro/v2](https://pkg.go.dev/go.alis.build/lro/v2) long-running operations |
-| [`launcherutils`](./launcherutils) | —           | Shared helpers used by sublaunchers (e.g. flag formatting)                                                     |
+| [`agui`](./agui) | `agui` | [AG-UI](https://docs.ag-ui.com) SSE endpoint for CopilotKit and other AG-UI clients |
+| [`lro`](./lro)   | `lro`  | HTTP resume routes for [go.alis.build/lro/v2](https://pkg.go.dev/go.alis.build/lro/v2) long-running operations |
 
 ## Quick start
 

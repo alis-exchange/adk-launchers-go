@@ -14,9 +14,9 @@
 //     (keyword: agui).
 //   - [lro] — HTTP resume callbacks for go.alis.build/lro/v2 long-running operations,
 //     invoked by Cloud Tasks (keyword: lro).
-//   - [launcherutils] — shared helpers for sublaunchers (path prefix normalization,
-//     flag help formatting). Not a sublauncher; used internally by other packages in
-//     this module.
+//
+// Shared implementation helpers live under internal/launcherutils and are not part of
+// the public import path.
 //
 // Configuration, routes, and usage examples for each sublauncher are documented in
 // that package's doc.go.

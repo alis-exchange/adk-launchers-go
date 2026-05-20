@@ -7,7 +7,7 @@ import (
 	"net/http"
 
 	"github.com/gorilla/mux"
-	"go.alis.build/adk/launchers/launcherutils"
+	"go.alis.build/adk/launchers/internal/launcherutils"
 	lro "go.alis.build/lro/v2"
 	"google.golang.org/adk/cmd/launcher"
 	"google.golang.org/adk/cmd/launcher/web"

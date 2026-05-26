@@ -34,7 +34,7 @@ func (l *aguiLauncher) loadSessionForSnapshot(ctx context.Context, userID, sessi
 }
 
 // ensureSessionForSnapshot returns an existing session or creates one so a run-start
-// StateSnapshot can be emitted before runner.Run (AutoCreateSession otherwise runs
+// StateSnapshot can be emitted before adkrun.RunSSE (AutoCreateSession otherwise runs
 // only inside the runner).
 func (l *aguiLauncher) ensureSessionForSnapshot(ctx context.Context, userID, sessionID string, initialState map[string]any) (session.Session, error) {
 	sess, ok, _ := l.loadSessionForSnapshot(ctx, userID, sessionID)

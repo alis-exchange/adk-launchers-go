@@ -16,11 +16,10 @@ import (
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/encoding/sse"
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
+	"go.alis.build/adk/launchers/internal/adkrun"
 	"go.alis.build/adk/launchers/internal/launcherutils"
-	"google.golang.org/adk/agent"
 	"google.golang.org/adk/cmd/launcher"
 	weblauncher "google.golang.org/adk/cmd/launcher/web"
-	"google.golang.org/adk/runner"
 	"google.golang.org/adk/session"
 	"google.golang.org/genai"
 )
@@ -135,7 +134,7 @@ func WithGenAIPartConverter(converter GenAIPartConverter) Option {
 type aguiLauncher struct {
 	flags          *flag.FlagSet
 	config         *AGUIConfig
-	runner         *runner.Runner
+	runtime        *adkrun.Runtime
 	sessionService session.Service // used for pending-interrupt persistence across runs
 }
 
@@ -196,30 +195,21 @@ func (l *aguiLauncher) SimpleDescription() string {
 // When CORS is configured, OPTIONS preflight is also handled for both routes.
 func (l *aguiLauncher) SetupSubrouters(router *mux.Router, config *launcher.Config) error {
 	// TODO: Support multi-tenant / multi-agent routing.
-	// The runner is currently created once at setup for the single root agent,
+	// The runtime is currently created once at setup for the single root agent,
 	// which means one aguiLauncher instance serves exactly one agent. To support
 	// multi-agent routing (e.g. /agui/{app_name}/run_sse), this would need to:
 	//   1. Register path-based routes with an {app_name} variable.
 	//   2. Extract app_name from the request in runSSEHandler.
 	//   3. Call config.AgentLoader.LoadAgent(appName) per request to resolve
 	//      the target agent dynamically.
-	//   4. Create the runner per request (as the REST API controller does in
-	//      server/adkrest/controllers/runtime.go RuntimeAPIController.getRunner).
+	//   4. Create the runtime per request (as adkrun.Runtime does internally).
 	// Until then, deploy one aguiLauncher per agent, matching the A2A launcher
 	// pattern which also binds to a single RootAgent at setup time.
-	agentRunner, err := runner.New(runner.Config{
-		AppName:           l.config.appName,
-		Agent:             config.AgentLoader.RootAgent(),
-		SessionService:    config.SessionService,
-		ArtifactService:   config.ArtifactService,
-		MemoryService:     config.MemoryService,
-		PluginConfig:      config.PluginConfig,
-		AutoCreateSession: true,
-	})
+	rt, err := adkrun.NewRuntime(config, l.config.appName)
 	if err != nil {
-		return fmt.Errorf("failed to create agent runner: %w", err)
+		return fmt.Errorf("failed to create ADK runtime: %w", err)
 	}
-	l.runner = agentRunner
+	l.runtime = rt
 	// Session service backs pending-interrupt tracking (AG-UI resume contract).
 	l.sessionService = config.SessionService
 
@@ -390,7 +380,7 @@ func convertMultimodalInput(ic types.InputContent) (*genai.Part, error) {
 
 // extractLastUserMessage returns the latest user turn from an AG-UI message history.
 // Clients often send the full transcript; ADK session service already stores
-// history keyed by threadId, so only the newest user message is passed to runner.Run.
+// history keyed by threadId, so only the newest user message is passed to adkrun.RunSSE.
 func extractLastUserMessage(messages []types.Message) (*genai.Content, error) {
 	for i := len(messages) - 1; i >= 0; i-- {
 		message := messages[i]
@@ -568,7 +558,7 @@ func (l *aguiLauncher) runSSEHandler() http.Handler {
 		state.reqState = reqState
 
 		// Baseline state before deltas (AG-UI spec). Create session when missing so
-		// first-turn runs can still emit a snapshot before runner.Run.
+		// first-turn runs can still emit a snapshot before adkrun.RunSSE.
 		snapSess, snapErr := l.ensureSessionForSnapshot(ctx, userID, sessionID, reqState)
 		if snapErr != nil {
 			emitError(fmt.Errorf("failed to prepare session for state snapshot: %w", snapErr))
@@ -601,20 +591,24 @@ func (l *aguiLauncher) runSSEHandler() http.Handler {
 		}
 
 		// Stream ADK events, mapping each to AG-UI protocol events.
-		cfg := agent.RunConfig{
-			StreamingMode:             agent.StreamingModeSSE,
+		runReq := adkrun.RunRequest{
+			UserID:                    userID,
+			SessionID:                 sessionID,
+			NewMessage:                *msg,
+			Streaming:                 true,
 			SaveInputBlobsAsArtifacts: false,
 		}
-
-		// Forward initial state from the AG-UI request into the ADK session.
-		// The frontend may send state (e.g. form values, UI context) that the
-		// agent's tools or instructions can read via session state.
-		var runOpts []runner.RunOption
 		if stateMap, ok := req.State.(map[string]any); ok && len(stateMap) > 0 {
-			runOpts = append(runOpts, runner.WithStateDelta(stateMap))
+			runReq.StateDelta = stateMap
 		}
 
-		for ev, err := range l.runner.Run(ctx, userID, sessionID, msg, cfg, runOpts...) {
+		_, adkEvents, err := l.runtime.RunSSE(ctx, runReq)
+		if err != nil {
+			emitError(err)
+			return
+		}
+
+		for ev, err := range adkEvents {
 			if err != nil {
 				emitError(err)
 				break

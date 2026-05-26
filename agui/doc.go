@@ -13,14 +13,14 @@
 // NewLauncher requires an app name string used as the ADK runner AppName and to
 // distinguish the root agent from sub-agent step events on the SSE stream.
 //
-// At setup time, SetupSubrouters creates a single runner.Runner bound to
-// config.AgentLoader.RootAgent(). One aguiLauncher instance therefore serves exactly
+// At setup time, SetupSubrouters creates a single [adkrun.Runtime] bound to the
+// configured app name. One aguiLauncher instance therefore serves exactly
 // one agent. To expose multiple agents, deploy one launcher per agent (the same
 // pattern as the A2A sublauncher) or extend routing to load agents per request.
 //
 // Conversation continuity uses a 1:1 mapping between AG-UI threadId and the ADK
-// session ID. The launcher enables AutoCreateSession on the runner so the first
-// request for a thread creates the session automatically.
+// session ID. [adkrun.Runtime] enables AutoCreateSession so the first request for a
+// thread creates the session automatically.
 //
 // # HTTP routes
 //
@@ -35,7 +35,7 @@
 // The /run_sse handler accepts a JSON [types.RunAgentInput] body. It extracts the
 // latest user message from the request (full history may be sent, but ADK session
 // service maintains authoritative history via threadId). Optional request state is
-// forwarded into the ADK session via runner.WithStateDelta.
+// forwarded into the ADK session via [adkrun.RunRequest.StateDelta].
 //
 // Errors before SSE headers are committed return standard HTTP status codes. After
 // the stream starts (RunStartedEvent emitted), errors are delivered as RunErrorEvent

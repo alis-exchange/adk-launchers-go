@@ -2,8 +2,6 @@ package agui
 
 import (
 	"context"
-	"iter"
-	"slices"
 	"testing"
 	"time"
 
@@ -13,14 +11,10 @@ import (
 	"google.golang.org/genai"
 )
 
-var (
-	_ session.Session = (*testSession)(nil)
-	_ session.Events  = (*testEvents)(nil)
-	_ session.State   = (*testState)(nil)
-)
+var _ session.Session = (*mockSession)(nil)
 
 func TestConvertSessionToMessages_TextMessage(t *testing.T) {
-	sess := buildSession(func(s *testSession) {
+	sess := buildSession(func(s *mockSession) {
 		ev := session.NewEvent("inv1")
 		ev.Content = genai.NewContentFromText("Hello, world!", genai.RoleModel)
 		s.events = append(s.events, ev)
@@ -43,7 +37,7 @@ func TestConvertSessionToMessages_TextMessage(t *testing.T) {
 }
 
 func TestConvertSessionToMessages_UserMessage(t *testing.T) {
-	sess := buildSession(func(s *testSession) {
+	sess := buildSession(func(s *mockSession) {
 		ev := session.NewEvent("inv1")
 		ev.Content = genai.NewContentFromText("Hi there", genai.RoleUser)
 		s.events = append(s.events, ev)
@@ -62,7 +56,7 @@ func TestConvertSessionToMessages_UserMessage(t *testing.T) {
 }
 
 func TestConvertSessionToMessages_FunctionCall(t *testing.T) {
-	sess := buildSession(func(s *testSession) {
+	sess := buildSession(func(s *mockSession) {
 		ev := session.NewEvent("inv1")
 		ev.Content = &genai.Content{
 			Role: string(genai.RoleModel),
@@ -103,7 +97,7 @@ func TestConvertSessionToMessages_FunctionCall(t *testing.T) {
 }
 
 func TestConvertSessionToMessages_FunctionResponse(t *testing.T) {
-	sess := buildSession(func(s *testSession) {
+	sess := buildSession(func(s *mockSession) {
 		ev := session.NewEvent("inv1")
 		ev.Content = &genai.Content{
 			Role: string(genai.RoleModel),
@@ -134,7 +128,7 @@ func TestConvertSessionToMessages_FunctionResponse(t *testing.T) {
 }
 
 func TestConvertSessionToMessages_Thought(t *testing.T) {
-	sess := buildSession(func(s *testSession) {
+	sess := buildSession(func(s *mockSession) {
 		ev := session.NewEvent("inv1")
 		ev.Content = &genai.Content{
 			Role: string(genai.RoleModel),
@@ -175,7 +169,7 @@ func TestConvertSessionToMessages_Thought(t *testing.T) {
 }
 
 func TestConvertSessionToMessages_SkipsPartialEvents(t *testing.T) {
-	sess := buildSession(func(s *testSession) {
+	sess := buildSession(func(s *mockSession) {
 		partial := session.NewEvent("inv1")
 		partial.Content = genai.NewContentFromText("partial delta", genai.RoleModel)
 		partial.Partial = true
@@ -201,7 +195,7 @@ func TestConvertSessionToMessages_SkipsPartialEvents(t *testing.T) {
 
 func TestConvertSessionToMessages_WithAfter(t *testing.T) {
 	now := time.Now()
-	sess := buildSession(func(s *testSession) {
+	sess := buildSession(func(s *mockSession) {
 		old := session.NewEvent("inv1")
 		old.Content = genai.NewContentFromText("old message", genai.RoleModel)
 		old.Timestamp = now.Add(-10 * time.Minute)
@@ -229,7 +223,7 @@ func TestConvertSessionToMessages_WithAfter(t *testing.T) {
 }
 
 func TestConvertSessionToMessages_WithLimit(t *testing.T) {
-	sess := buildSession(func(s *testSession) {
+	sess := buildSession(func(s *mockSession) {
 		for i := 0; i < 5; i++ {
 			ev := session.NewEvent("inv1")
 			ev.Content = genai.NewContentFromText("msg", genai.RoleModel)
@@ -249,7 +243,7 @@ func TestConvertSessionToMessages_WithLimit(t *testing.T) {
 }
 
 func TestConvertSessionToMessages_WithPartConverter(t *testing.T) {
-	sess := buildSession(func(s *testSession) {
+	sess := buildSession(func(s *mockSession) {
 		ev := session.NewEvent("inv1")
 		ev.Content = &genai.Content{
 			Role: string(genai.RoleModel),
@@ -302,7 +296,7 @@ func TestConvertSessionToMessages_WithPartConverter(t *testing.T) {
 }
 
 func TestConvertSessionToMessages_MultipleToolCalls(t *testing.T) {
-	sess := buildSession(func(s *testSession) {
+	sess := buildSession(func(s *mockSession) {
 		ev := session.NewEvent("inv1")
 		ev.Content = &genai.Content{
 			Role: string(genai.RoleModel),
@@ -327,7 +321,7 @@ func TestConvertSessionToMessages_MultipleToolCalls(t *testing.T) {
 }
 
 func TestConvertSessionToMessages_EmptySession(t *testing.T) {
-	sess := buildSession(func(_ *testSession) {})
+	sess := buildSession(func(_ *mockSession) {})
 
 	msgs, err := ConvertSessionToMessages(context.Background(), sess)
 	if err != nil {
@@ -339,7 +333,7 @@ func TestConvertSessionToMessages_EmptySession(t *testing.T) {
 }
 
 func TestConvertSessionToMessages_MessageIDs(t *testing.T) {
-	sess := buildSession(func(s *testSession) {
+	sess := buildSession(func(s *mockSession) {
 		ev := session.NewEvent("inv1")
 		ev.ID = "evt-abc"
 		ev.Content = &genai.Content{
@@ -368,7 +362,7 @@ func TestConvertSessionToMessages_MessageIDs(t *testing.T) {
 }
 
 func TestConvertSessionToMessages_TextBeforeFunctionCall(t *testing.T) {
-	sess := buildSession(func(s *testSession) {
+	sess := buildSession(func(s *mockSession) {
 		ev := session.NewEvent("inv1")
 		ev.ID = "evt-1"
 		ev.Content = &genai.Content{
@@ -398,41 +392,8 @@ func TestConvertSessionToMessages_TextBeforeFunctionCall(t *testing.T) {
 	}
 }
 
-// --- test helpers ---
-
-type testSession struct {
-	id     string
-	events []*session.Event
-}
-
-func (s *testSession) ID() string                      { return s.id }
-func (s *testSession) AppName() string                  { return "test-app" }
-func (s *testSession) UserID() string                   { return "test-user" }
-func (s *testSession) State() session.State             { return &testState{} }
-func (s *testSession) Events() session.Events           { return &testEvents{events: s.events} }
-func (s *testSession) LastUpdateTime() time.Time        { return time.Now() }
-
-type testEvents struct {
-	events []*session.Event
-}
-
-func (e *testEvents) All() iter.Seq[*session.Event] {
-	return slices.Values(e.events)
-}
-
-func (e *testEvents) Len() int              { return len(e.events) }
-func (e *testEvents) At(i int) *session.Event { return e.events[i] }
-
-type testState struct{}
-
-func (s *testState) Get(_ string) (any, error) { return nil, session.ErrStateKeyNotExist }
-func (s *testState) Set(_ string, _ any) error { return nil }
-func (s *testState) All() iter.Seq2[string, any] {
-	return func(yield func(string, any) bool) {}
-}
-
-func buildSession(setup func(*testSession)) session.Session {
-	s := &testSession{id: "test-session"}
+func buildSession(setup func(*mockSession)) session.Session {
+	s := &mockSession{id: "test-session"}
 	setup(s)
 	return s
 }

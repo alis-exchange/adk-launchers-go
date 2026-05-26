@@ -8,13 +8,14 @@ import (
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 )
 
-// User represents the authenticated user making the AG-UI request.
+// User identifies the principal for an AG-UI request. Interceptors should set
+// Name in [CallInterceptor.Before]; it becomes the ADK user id for session lookup.
 type User struct {
 	Name          string
 	Authenticated bool
 }
 
-// CallContext holds metadata about the current AG-UI request.
+// CallContext holds per-request metadata shared across interceptor hooks.
 type CallContext struct {
 	User *User
 }

@@ -3,7 +3,7 @@ module go.alis.build/adk/launchers
 go 1.26.1
 
 require (
-	github.com/ag-ui-protocol/ag-ui/sdks/community/go v0.0.0-20260522220000-f49322bfa7c6
+	github.com/ag-ui-protocol/ag-ui/sdks/community/go v0.0.0-20260526033548-d74e2dfc1e11
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/mux v1.8.1
 	go.alis.build/lro/v2 v2.8.0

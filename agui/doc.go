@@ -47,7 +47,7 @@
 //
 //   - WithInterceptor — add [CallInterceptor] hooks (auth, logging, event mutation).
 //   - WithCORS — enable CORS middleware for browser-based frontends.
-//   - WithCapabilities — expose GET /capabilities for client discovery.
+//   - WithCapabilities — expose GET /capabilities for client discovery (see below).
 //   - WithGenAIPartConverter — customize how [genai.Part] values map to AG-UI events.
 //
 // CLI flags (after the "agui" keyword on the web command line):
@@ -123,6 +123,41 @@
 // Clients use this endpoint to adapt UI features (tools, multimodal input, streaming,
 // human-in-the-loop, and so on).
 //
+// [WithCapabilities] calls [MergeInterruptCapabilities] so that agents using this
+// launcher advertise AG-UI interrupt resume by default (humanInTheLoop.interrupts
+// and humanInTheLoop.approveWithEdits). Set those fields explicitly to false in
+// your [Capabilities] value if you need to opt out. Alternatively, use
+// [DefaultInterruptCapabilities] as a starting point for a minimal HITL-only document.
+//
+// # Interrupts and resume (human-in-the-loop)
+//
+// When ADK pauses for tool confirmation (FunctionCall name
+// adk_request_confirmation), the launcher emits a [types.Interrupt] inside
+// RunFinished.outcome and records pending interrupts in ADK session state under
+// [pendingInterruptsStateKey]. The interrupt id is the confirmation call id
+// (fc.ID), so clients resume with:
+//
+//	resume: [{ interruptId: "<confirmation-call-id>", status: "resolved", payload: { approved: true } }]
+//
+// Resume validation runs after RunStarted (protocol errors become RunError on
+// the SSE stream). The server enforces AG-UI contract rules when pending state
+// exists: all open interrupts must be addressed, unknown ids rejected, optional
+// expiry and responseSchema checks applied. See [validateResumeAgainstPending]
+// and [resumeEntriesToConfirmationContent].
+//
+// Mapping from AG-UI to ADK uses payload.approved → response.confirmed and
+// optional payload.editedArgs → response.payload, per ADK toolconfirmation
+// conventions and the AG-UI approve-with-edits pattern.
+//
+// Only interrupts with reason "tool_call" are emitted (from ADK tool confirmations).
+// AG-UI core reasons "input_required" and "confirmation" are deferred until ADK
+// exposes a native pause primitive; see the TODO in stream.go. Non-tool resume
+// paths are not implemented (see resume.go).
+//
+// At run start and before interrupt RunFinished, the launcher emits StateSnapshot
+// (and MessagesSnapshot at interrupt boundaries) so clients have baseline context.
+// Successful runs emit RunFinished with outcome.type "success".
+//
 // # CORS
 //
 // Browser frontends (CopilotKit, Vue/React SPAs) typically call the agent server from
@@ -138,8 +173,18 @@
 //
 // # Limitations
 //
-// This package does not implement multi-agent path routing, AG-UI interrupt resume
-// (emit is supported; resume awaits SDK RunAgentInput.Resume), or an initial
-// StateSnapshotEvent at run start. It does not register ADK tools or plugins; it only
-// mounts HTTP endpoints and maps ADK execution to AG-UI SSE.
+// This package does not implement multi-agent path routing (one root agent per
+// launcher instance). AG-UI interrupt resume is supported for ADK tool
+// confirmations (adk_request_confirmation) with reason "tool_call" only.
+// Core AG-UI reasons "input_required" and "confirmation" are not implemented;
+// support depends on a future ADK pause/HITL API (see TODO in stream.go).
+// Resume without matching pending session state is rejected. Resume idempotency
+// (replay of the same resume tuple) is not deduplicated server-side. Payload
+// validation uses a minimal JSON Schema subset, not a full validator. Pending
+// interrupt persist/clear failures after the terminal event are logged
+// server-side (not re-emitted as RunError, which would violate the
+// single-terminal-event protocol rule). Use
+// [WithCapabilities] or [DefaultInterruptCapabilities] to advertise
+// humanInTheLoop.interrupts and approveWithEdits. It does not register ADK tools
+// or plugins; it only mounts HTTP endpoints and maps ADK execution to AG-UI SSE.
 package agui

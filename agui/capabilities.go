@@ -1,8 +1,8 @@
 package agui
 
-// Capabilities mirrors the AG-UI AgentCapabilities interface.
-// Only populate fields the agent actually supports; omitted fields
-// mean the capability is undeclared ("absent = unknown").
+// Capabilities mirrors the AG-UI AgentCapabilities interface returned from
+// GET /capabilities. Only populate fields the agent actually supports; omitted
+// fields mean the capability is undeclared ("absent = unknown" to clients).
 type Capabilities struct {
 	Identity       *IdentityCapabilities       `json:"identity,omitempty"`
 	Transport      *TransportCapabilities      `json:"transport,omitempty"`
@@ -117,7 +117,8 @@ type ExecutionCapabilities struct {
 	MaxExecutionTime *int  `json:"maxExecutionTime,omitempty"`
 }
 
-// HumanInTheLoopCapabilities declares human-in-the-loop support.
+// HumanInTheLoopCapabilities declares human-in-the-loop support per the AG-UI
+// capabilities spec. See https://docs.ag-ui.com/concepts/capabilities#human-in-the-loop.
 type HumanInTheLoopCapabilities struct {
 	Supported        *bool `json:"supported,omitempty"`
 	Approvals        *bool `json:"approvals,omitempty"`
@@ -125,4 +126,38 @@ type HumanInTheLoopCapabilities struct {
 	Feedback         *bool `json:"feedback,omitempty"`
 	Interrupts       *bool `json:"interrupts,omitempty"`
 	ApproveWithEdits *bool `json:"approveWithEdits,omitempty"`
+}
+
+// MergeInterruptCapabilities ensures humanInTheLoop.interrupts and
+// humanInTheLoop.approveWithEdits are set to true when left unset.
+//
+// This launcher always implements the AG-UI interrupt emit/resume path for ADK
+// tool confirmations, so advertising those flags helps CopilotKit and other
+// clients enable approval UI without each integrator remembering to set them.
+// Callers who pass a fully custom [Capabilities] document via [WithCapabilities]
+// still get this merge so discovery stays accurate; set Interrupts or
+// ApproveWithEdits explicitly to false to opt out.
+//
+// MergeInterruptCapabilities does not set humanInTheLoop.supported or other
+// HITL fields—only the interrupt-protocol-specific flags from the AG-UI spec.
+func MergeInterruptCapabilities(caps *Capabilities) {
+	if caps.HumanInTheLoop == nil {
+		caps.HumanInTheLoop = &HumanInTheLoopCapabilities{}
+	}
+	if caps.HumanInTheLoop.Interrupts == nil {
+		caps.HumanInTheLoop.Interrupts = new(true)
+	}
+	if caps.HumanInTheLoop.ApproveWithEdits == nil {
+		caps.HumanInTheLoop.ApproveWithEdits = new(true)
+	}
+}
+
+// DefaultInterruptCapabilities returns a minimal [Capabilities] value suitable
+// for agents that only need to advertise AG-UI interrupt resume for ADK tool
+// confirmations. Combine with other capability structs via manual field assignment
+// if you need a fuller discovery document.
+func DefaultInterruptCapabilities() Capabilities {
+	caps := Capabilities{}
+	MergeInterruptCapabilities(&caps)
+	return caps
 }

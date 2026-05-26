@@ -5,75 +5,23 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
 
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
+	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/encoding/sse"
-	"github.com/google/uuid"
 	"google.golang.org/adk/session"
 	"google.golang.org/adk/tool/toolconfirmation"
 	"google.golang.org/genai"
 )
 
-// bufPool reuses byte buffers for JSON serialization on the event-emission hot path.
+// bufPool reuses byte buffers for JSON serialization on the SSE event-emission
+// hot path (tool args, function responses, interrupt payloads).
 var bufPool = sync.Pool{
 	New: func() any { return new(bytes.Buffer) },
-}
-
-// TODO: Remove interruptOutcome and interrupt once the AG-UI Go SDK adds
-// typed Outcome/Interrupt structs to its events and types packages.
-//
-// interruptOutcome is the AG-UI RunFinished outcome for interrupt-aware runs.
-// See https://docs.ag-ui.com/concepts/interrupts#run-outcomes
-type interruptOutcome struct {
-	Type       string      `json:"type"`
-	Interrupts []interrupt `json:"interrupts"`
-}
-
-// interrupt describes a single pause point requiring user input.
-// See https://docs.ag-ui.com/concepts/interrupts#the-interrupt-type
-type interrupt struct {
-	ID             string         `json:"id"`
-	Reason         string         `json:"reason"`
-	Message        string         `json:"message,omitempty"`
-	ToolCallID     string         `json:"toolCallId,omitempty"`
-	ResponseSchema map[string]any `json:"responseSchema,omitempty"`
-	Metadata       map[string]any `json:"metadata,omitempty"`
-}
-
-// TODO: Remove runFinishedInterruptEvent once the AG-UI Go SDK adds an
-// Outcome field to RunFinishedEvent; use the SDK type directly instead.
-//
-// runFinishedInterruptEvent extends RunFinished with the outcome field required
-// by the AG-UI interrupt protocol. The community Go SDK's RunFinishedEvent does
-// not yet have an Outcome field, so we define a local event type that includes it.
-type runFinishedInterruptEvent struct {
-	*events.BaseEvent
-	ThreadIDValue string            `json:"threadId"`
-	RunIDValue    string            `json:"runId"`
-	Outcome       *interruptOutcome `json:"outcome,omitempty"`
-}
-
-func (e *runFinishedInterruptEvent) ThreadID() string        { return e.ThreadIDValue }
-func (e *runFinishedInterruptEvent) RunID() string           { return e.RunIDValue }
-func (e *runFinishedInterruptEvent) ToJSON() ([]byte, error) { return json.Marshal(e) }
-
-func (e *runFinishedInterruptEvent) Validate() error {
-	if err := e.BaseEvent.Validate(); err != nil {
-		return err
-	}
-	if e.ThreadIDValue == "" {
-		return fmt.Errorf("runFinishedInterruptEvent: threadId is required")
-	}
-	if e.RunIDValue == "" {
-		return fmt.Errorf("runFinishedInterruptEvent: runId is required")
-	}
-	if e.Outcome == nil || len(e.Outcome.Interrupts) == 0 {
-		return fmt.Errorf("runFinishedInterruptEvent: outcome with at least one interrupt is required")
-	}
-	return nil
 }
 
 // emitter wraps the SSE writer and captures the first write error. After a
@@ -92,10 +40,14 @@ type emitter struct {
 	callCtx      *CallContext
 }
 
+// newEmitter constructs an SSE emitter for one /run_sse request. Interceptors
+// are limited to those whose Before hook succeeded (see runSSEHandler).
 func newEmitter(ctx context.Context, w http.ResponseWriter, writer *sse.SSEWriter, interceptors []CallInterceptor, callCtx *CallContext) *emitter {
 	return &emitter{ctx: ctx, w: w, writer: writer, interceptors: interceptors, callCtx: callCtx}
 }
 
+// emit writes an AG-UI event to the SSE stream, running OnEmit interceptors first.
+// After the first write error (typically client disconnect), emit becomes a no-op.
 func (e *emitter) emit(event events.Event) {
 	if e.err != nil {
 		return
@@ -120,14 +72,18 @@ func (e *emitter) emit(event events.Event) {
 //
 // Fields are ordered largest-first (strings before bools) to minimize struct padding.
 type streamState struct {
-	runID                     string // AG-UI run identifier
-	threadID                  string // AG-UI thread identifier; also used as ADK session ID
-	currentTextMessageID      string // active text message, empty when none open
-	currentReasoningPhaseID   string // active reasoning phase (ReasoningStart/End), empty when none open
-	currentReasoningMessageID string // active reasoning message within the phase, empty when none open
-	lastTextMessageID         string // most recent closed text message, used as parentMessageID for tool calls
-	currentStepAuthor         string // active sub-agent step, empty when at root agent
-	runFinalized              bool   // true once RunFinished or RunError has been emitted
+	runID                     string            // AG-UI run identifier
+	threadID                  string            // AG-UI thread identifier; also used as ADK session ID
+	userID                    string            // ADK user id for session snapshot loads
+	runCtx                    context.Context   // request context for session snapshot loads
+	reqState                  map[string]any    // RunAgentInput.state merged into snapshots
+	currentTextMessageID      string            // active text message, empty when none open
+	currentReasoningPhaseID   string            // active reasoning phase (ReasoningStart/End), empty when none open
+	currentReasoningMessageID string            // active reasoning message within the phase, empty when none open
+	lastTextMessageID         string            // most recent closed text message, used as parentMessageID for tool calls
+	currentStepAuthor         string            // active sub-agent step, empty when at root agent
+	runFinalized              bool              // true once RunFinished or RunError has been emitted
+	emittedInterrupts         []types.Interrupt // interrupts emitted this run; persisted to session state
 }
 
 // processEvent maps a single ADK session.Event to the corresponding AG-UI SSE events.
@@ -233,6 +189,13 @@ func (l *aguiLauncher) processEvent(e *emitter, ev *session.Event, state *stream
 				closeTextMessage(e, state)
 				closeReasoningMessage(e, state)
 
+				// TODO(non-tool-interrupts): When ADK exposes a native pause/HITL primitive for
+				// structured input (AG-UI reason "input_required") or free-standing confirmation
+				// (reason "confirmation"), detect it here and emit RunFinished with the appropriate
+				// Interrupt (no toolCallId for input_required; optional responseSchema from ADK).
+				// Resume mapping belongs in resume.go (new branch per reason, not adk_request_confirmation).
+				// Pending validation in interrupt_state.go may need reason-specific schema rules.
+				// See https://docs.ag-ui.com/concepts/interrupts#reason-taxonomy
 				if part.FunctionCall.Name == toolconfirmation.FunctionCallName {
 					if err := l.emitInterrupt(e, state, part.FunctionCall); err != nil {
 						return false, err
@@ -292,16 +255,23 @@ func (l *aguiLauncher) processEvent(e *emitter, ev *session.Event, state *stream
 
 	// On turn completion, close all open lifecycle events.
 	if ev.TurnComplete {
-		closeTextMessage(e, state)
-		closeReasoningMessage(e, state)
-
-		if state.currentStepAuthor != "" {
-			e.emit(events.NewStepFinishedEvent(state.currentStepAuthor))
-			state.currentStepAuthor = ""
-		}
+		finalizeLifecycle(e, state)
 	}
 
 	return false, e.err
+}
+
+// finalizeLifecycle closes any open text messages, reasoning phases, and
+// sub-agent steps. Must be called before any run-terminal event (RunFinished,
+// RunError) to satisfy the AG-UI protocol requirement that all steps are closed
+// before the run ends.
+func finalizeLifecycle(e *emitter, state *streamState) {
+	closeTextMessage(e, state)
+	closeReasoningMessage(e, state)
+	if state.currentStepAuthor != "" {
+		e.emit(events.NewStepFinishedEvent(state.currentStepAuthor))
+		state.currentStepAuthor = ""
+	}
 }
 
 // closeTextMessage emits a TextMessageEndEvent for the currently open text message
@@ -329,9 +299,15 @@ func closeReasoningMessage(e *emitter, state *streamState) {
 }
 
 // emitInterrupt converts an adk_request_confirmation FunctionCall into an
-// AG-UI interrupt. It emits ToolCall events for the original tool (the agent's
-// proposal — part of the AG-UI audit trail for tool-bound interrupts), then
-// emits RunFinished with an interrupt outcome and sets state.runFinalized.
+// AG-UI interrupt outcome and ends the run.
+//
+// Flow (see https://docs.ag-ui.com/concepts/interrupts#tool-bound-interrupts):
+//  1. Emit ToolCallStart/Args/End for the original tool (agent proposal).
+//  2. Emit RunFinished with outcome.type interrupt and a single Interrupt record.
+//  3. Set interrupt.id to fc.ID so clients can resume with that id as interruptId.
+//
+// The resumed run should not re-emit tool call lifecycle events; ADK continues
+// after the client sends a FunctionResponse via [resumeEntriesToConfirmationContent].
 func (l *aguiLauncher) emitInterrupt(e *emitter, state *streamState, fc *genai.FunctionCall) error {
 	originalCall, err := toolconfirmation.OriginalCallFrom(fc)
 	if err != nil {
@@ -351,15 +327,8 @@ func (l *aguiLauncher) emitInterrupt(e *emitter, state *streamState, fc *genai.F
 		}
 	}
 
-	// Close all open lifecycle events before emitting the interrupt terminal
-	// event. The AG-UI protocol requires all steps to be finished before
-	// RunFinished is sent.
-	closeTextMessage(e, state)
-	closeReasoningMessage(e, state)
-	if state.currentStepAuthor != "" {
-		e.emit(events.NewStepFinishedEvent(state.currentStepAuthor))
-		state.currentStepAuthor = ""
-	}
+	// Close all open lifecycle events before the interrupt terminal event.
+	finalizeLifecycle(e, state)
 
 	// Emit ToolCall events for the original tool (the agent's proposal).
 	// Per the AG-UI spec ("Tool-bound interrupts"), the interrupted run
@@ -377,34 +346,43 @@ func (l *aguiLauncher) emitInterrupt(e *emitter, state *streamState, fc *genai.F
 	e.emit(events.NewToolCallArgsEvent(originalCall.ID, argsJSON))
 	e.emit(events.NewToolCallEndEvent(originalCall.ID))
 
-	// Build and emit RunFinished with interrupt outcome.
-	e.emit(&runFinishedInterruptEvent{
-		BaseEvent:     events.NewBaseEvent(events.EventTypeRunFinished),
-		ThreadIDValue: state.threadID,
-		RunIDValue:    state.runID,
-		Outcome: &interruptOutcome{
-			Type: "interrupt",
-			Interrupts: []interrupt{{
-				ID:         uuid.New().String(),
-				Reason:     "tool_call",
-				Message:    hintMessage,
-				ToolCallID: originalCall.ID,
-				ResponseSchema: map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"approved": map[string]any{"type": "boolean"},
-					},
-					"required": []string{"approved"},
-				},
-				Metadata: map[string]any{
-					"adk": map[string]any{
-						"confirmationCallId":   fc.ID,
-						"confirmationCallName": toolconfirmation.FunctionCallName,
-					},
-				},
-			}},
+	// AG-UI spec: emit snapshots before interrupt RunFinished so clients can resume
+	// from persisted state and message history (see docs.ag-ui.com/concepts/interrupts).
+	if state.runCtx != nil && state.userID != "" {
+		if sess, ok, err := l.loadSessionForSnapshot(state.runCtx, state.userID, state.threadID); err == nil && ok {
+			emitStateSnapshotIfNonEmpty(e, buildStateSnapshot(sess, state.reqState))
+			if msgs, err := l.buildMessagesSnapshot(state.runCtx, sess); err != nil {
+				log.Printf("agui: failed to build messages snapshot for interrupt: %v", err)
+			} else {
+				emitMessagesSnapshotIfNonEmpty(e, msgs)
+			}
+		} else if len(state.reqState) > 0 {
+			emitStateSnapshotIfNonEmpty(e, buildStateSnapshot(nil, state.reqState))
+		}
+	}
+
+	// interrupt.id doubles as ADK confirmation call id for resume correlation.
+	interrupt := types.Interrupt{
+		ID:             fc.ID,
+		Reason:         "tool_call",
+		Message:        hintMessage,
+		ToolCallID:     originalCall.ID,
+		ResponseSchema: toolConfirmationResponseSchema(),
+		Metadata: map[string]any{
+			"adk": map[string]any{
+				"confirmationCallId":   fc.ID,
+				"confirmationCallName": toolconfirmation.FunctionCallName,
+			},
 		},
-	})
+	}
+
+	// Build and emit RunFinished with interrupt outcome.
+	e.emit(events.NewRunFinishedEventWithOptions(
+		state.threadID,
+		state.runID,
+		events.WithInterruptOutcome([]types.Interrupt{interrupt}),
+	))
+	state.emittedInterrupts = append(state.emittedInterrupts, interrupt)
 	state.runFinalized = true
 	return nil
 }

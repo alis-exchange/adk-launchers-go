@@ -30,6 +30,8 @@ github.com/ag-ui-protocol/ag-ui/sdks/community/go v0.0.0-20260522063816-823f94f5
 github.com/ag-ui-protocol/ag-ui/sdks/community/go v0.0.0-20260522063816-823f94f5109f/go.mod h1:ERAMOexUee4AIuoxksuuGoEcHl3aqLwaazjGwlR9ZCI=
 github.com/ag-ui-protocol/ag-ui/sdks/community/go v0.0.0-20260522220000-f49322bfa7c6 h1:SHezo2b4tSd57V1EFIUuyEWDzfcwo1iBiCLWrY3OjTc=
 github.com/ag-ui-protocol/ag-ui/sdks/community/go v0.0.0-20260522220000-f49322bfa7c6/go.mod h1:ERAMOexUee4AIuoxksuuGoEcHl3aqLwaazjGwlR9ZCI=
+github.com/ag-ui-protocol/ag-ui/sdks/community/go v0.0.0-20260526033548-d74e2dfc1e11 h1:fSMf5bubkVlzPoKvqeYYuIwwPbhMPJennh5T59YJ9ZU=
+github.com/ag-ui-protocol/ag-ui/sdks/community/go v0.0.0-20260526033548-d74e2dfc1e11/go.mod h1:ERAMOexUee4AIuoxksuuGoEcHl3aqLwaazjGwlR9ZCI=
 github.com/cenkalti/backoff/v5 v5.0.3 h1:ZN+IMa753KfX5hd8vVaMixjnqRZ3y8CuJKRKj1xcsSM=
 github.com/cenkalti/backoff/v5 v5.0.3/go.mod h1:rkhZdG3JZukswDf7f0cwqPNk4K0sa+F97BxZthm/crw=
 github.com/census-instrumentation/opencensus-proto v0.2.1/go.mod h1:f6KPmirojxKA12rnyqOA5BBL4O983OfeGPqjHWSTneU=

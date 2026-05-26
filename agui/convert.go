@@ -12,6 +12,7 @@ import (
 	"google.golang.org/genai"
 )
 
+// convertConfig holds options for [ConvertSessionToMessages].
 type convertConfig struct {
 	partConverter GenAIPartConverter
 	after         time.Time
@@ -97,6 +98,7 @@ func ConvertSessionToMessages(ctx context.Context, sess session.Session, opts ..
 }
 
 // convertEvent converts a single ADK session event into zero or more AG-UI messages.
+// Multiple parts in one event are folded into fewer messages (text buffer, tool call batch).
 func convertEvent(ctx context.Context, ev *session.Event, cfg *convertConfig) ([]types.Message, error) {
 	role := mapContentRole(ev.Content.Role)
 
@@ -278,6 +280,7 @@ func messageID(eventID string, partIndex int) string {
 	return fmt.Sprintf("%s-%d", eventID, partIndex)
 }
 
+// marshalMap serializes tool arguments or responses for AG-UI message content fields.
 func marshalMap(m map[string]any) (string, error) {
 	if m == nil {
 		return "{}", nil

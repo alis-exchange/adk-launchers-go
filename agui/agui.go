@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
@@ -59,17 +60,26 @@ type CORSConfig struct {
 // mean "handled, skip default".
 type GenAIPartConverter func(ctx context.Context, adkEvent *session.Event, part *genai.Part) ([]events.Event, error)
 
-// AGUIConfig holds configuration for the AG-UI sublauncher.
+// AGUIConfig holds configuration for the AG-UI sublauncher. It is populated
+// by [NewLauncher] and functional options; fields are read when routes are
+// registered in [aguiLauncher.SetupSubrouters] and on each /run_sse request.
 type AGUIConfig struct {
-	appName            string
-	pathPrefix         string
-	interceptors       []CallInterceptor
-	cors               *CORSConfig
-	capabilities       *Capabilities
+	// appName is the ADK runner AppName and used to distinguish the root agent
+	// from sub-agent authors when emitting StepStarted/StepFinished events.
+	appName string
+	// pathPrefix is the HTTP path prefix for /run_sse and /capabilities (default "/agui").
+	pathPrefix string
+	// interceptors run Before/OnEmit/After hooks around each /run_sse request.
+	interceptors []CallInterceptor
+	// cors, when non-nil, enables CORS middleware on AG-UI routes.
+	cors *CORSConfig
+	// capabilities, when non-nil, enables GET /capabilities JSON discovery.
+	capabilities *Capabilities
+	// genAIPartConverter optionally overrides mapping of genai.Part to AG-UI events.
 	genAIPartConverter GenAIPartConverter
 }
 
-// Option configures an AGUIConfig.
+// Option configures an [AGUIConfig] passed to [NewLauncher].
 type Option func(*AGUIConfig)
 
 // WithInterceptor adds a CallInterceptor to the AG-UI launcher.
@@ -92,8 +102,13 @@ func WithCORS(cors CORSConfig) Option {
 
 // WithCapabilities declares the agent's capabilities so clients can discover
 // supported features via GET /capabilities and adapt their UI accordingly.
+//
+// It calls [MergeInterruptCapabilities] on the provided value so interrupt
+// resume support is advertised by default (see that function for rationale).
+// Pass humanInTheLoop.interrupts or approveWithEdits as false to opt out.
 func WithCapabilities(caps Capabilities) Option {
 	return func(c *AGUIConfig) {
+		MergeInterruptCapabilities(&caps)
 		c.capabilities = &caps
 	}
 }
@@ -115,15 +130,18 @@ func WithGenAIPartConverter(converter GenAIPartConverter) Option {
 	}
 }
 
-// aguiLauncher implements weblauncher.Sublauncher for the AG-UI protocol.
+// aguiLauncher implements [weblauncher.Sublauncher] for the AG-UI protocol.
+// A single instance serves one root agent; see SetupSubrouters for routing limits.
 type aguiLauncher struct {
-	flags  *flag.FlagSet
-	config *AGUIConfig
-	runner *runner.Runner
+	flags          *flag.FlagSet
+	config         *AGUIConfig
+	runner         *runner.Runner
+	sessionService session.Service // used for pending-interrupt persistence across runs
 }
 
-// NewLauncher creates a new AG-UI sublauncher that serves the /run_sse endpoint
-// for streaming agent responses via Server-Sent Events.
+// NewLauncher creates a new AG-UI sublauncher. Register it with [web.NewLauncher]
+// and activate it with the "agui" CLI keyword. The appName argument becomes the
+// ADK runner's AppName and must match the root agent name for step event filtering.
 func NewLauncher(appName string, opts ...Option) weblauncher.Sublauncher {
 	config := &AGUIConfig{
 		appName: appName,
@@ -202,6 +220,8 @@ func (l *aguiLauncher) SetupSubrouters(router *mux.Router, config *launcher.Conf
 		return fmt.Errorf("failed to create agent runner: %w", err)
 	}
 	l.runner = agentRunner
+	// Session service backs pending-interrupt tracking (AG-UI resume contract).
+	l.sessionService = config.SessionService
 
 	h := l.runSSEHandler()
 
@@ -312,14 +332,36 @@ func (l *aguiLauncher) corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// convertMultimodalInput converts a non-text, non-binary InputContent (e.g.
-// image, audio, video, document) to a genai.Part. These types use a nested
-// source object in the AG-UI spec, but the Go SDK's InputContent struct
-// doesn't have a Source field yet — so we check the flat fields (Data, URL,
-// MimeType) which may be populated by future SDK versions, and fall back to
-// an error if no usable data is found.
+// convertMultimodalInput converts a typed AG-UI InputContent (image, audio,
+// video, document) to a [genai.Part]. The AG-UI spec nests payload under
+// source.{type,value,mimeType}; older clients may still send flat Data/URL fields.
 func convertMultimodalInput(ic types.InputContent) (*genai.Part, error) {
-	// Inline base64 data (source.type = "data")
+	if ic.Source != nil {
+		switch ic.Source.Type {
+		case types.InputContentSourceTypeData:
+			dataBytes, err := base64.StdEncoding.DecodeString(ic.Source.Value)
+			if err != nil {
+				return nil, fmt.Errorf("failed to decode base64 source data: %w", err)
+			}
+			return &genai.Part{
+				InlineData: &genai.Blob{
+					Data:     dataBytes,
+					MIMEType: ic.Source.MimeType,
+				},
+			}, nil
+		case types.InputContentSourceTypeURL:
+			return &genai.Part{
+				FileData: &genai.FileData{
+					FileURI:  ic.Source.Value,
+					MIMEType: ic.Source.MimeType,
+				},
+			}, nil
+		default:
+			return nil, fmt.Errorf("unsupported source type %q", ic.Source.Type)
+		}
+	}
+
+	// Legacy flat fields (source.type = "data")
 	if ic.Data != "" {
 		dataBytes, err := base64.StdEncoding.DecodeString(ic.Data)
 		if err != nil {
@@ -333,7 +375,7 @@ func convertMultimodalInput(ic types.InputContent) (*genai.Part, error) {
 		}, nil
 	}
 
-	// URL reference (source.type = "url")
+	// Legacy flat fields (source.type = "url")
 	if ic.URL != "" {
 		return &genai.Part{
 			FileData: &genai.FileData{
@@ -343,12 +385,56 @@ func convertMultimodalInput(ic types.InputContent) (*genai.Part, error) {
 		}, nil
 	}
 
-	// TODO: The AG-UI Go SDK needs a Source field on InputContent to fully
-	// support the new multimodal format (image/audio/video/document types
-	// with nested { type, value, mimeType } source objects). Until then,
-	// clients using the new format will hit this error. Track the Go SDK
-	// update and remove this fallback once Source is available.
-	return nil, fmt.Errorf("no data or url available (Go SDK may need Source field support)")
+	return nil, fmt.Errorf("no data, url, or source available")
+}
+
+// extractLastUserMessage returns the latest user turn from an AG-UI message history.
+// Clients often send the full transcript; ADK session service already stores
+// history keyed by threadId, so only the newest user message is passed to runner.Run.
+func extractLastUserMessage(messages []types.Message) (*genai.Content, error) {
+	for i := len(messages) - 1; i >= 0; i-- {
+		message := messages[i]
+		if message.Role != types.RoleUser {
+			continue
+		}
+
+		if inputContents, ok := message.ContentInputContents(); ok && len(inputContents) > 0 {
+			parts := make([]*genai.Part, len(inputContents))
+			for j, inputContent := range inputContents {
+				switch inputContent.Type {
+				case types.InputContentTypeText:
+					parts[j] = genai.NewPartFromText(inputContent.Text)
+				case types.InputContentTypeBinary:
+					dataBytes, err := base64.StdEncoding.DecodeString(inputContent.Data)
+					if err != nil {
+						return nil, fmt.Errorf("failed to decode base64 binary data: %w", err)
+					}
+					parts[j] = &genai.Part{
+						InlineData: &genai.Blob{
+							Data:        dataBytes,
+							MIMEType:    inputContent.MimeType,
+							DisplayName: inputContent.Filename,
+						},
+					}
+				default:
+					part, err := convertMultimodalInput(inputContent)
+					if err != nil {
+						return nil, fmt.Errorf("unsupported content type %q: %w", inputContent.Type, err)
+					}
+					parts[j] = part
+				}
+			}
+			return genai.NewContentFromParts(parts, genai.RoleUser), nil
+		}
+
+		if contentStr, ok := message.ContentString(); ok && contentStr != "" {
+			return genai.NewContentFromText(contentStr, genai.RoleUser), nil
+		}
+
+		return nil, fmt.Errorf("unsupported content type: %T", message.Content)
+	}
+
+	return nil, fmt.Errorf("no user message found in payload")
 }
 
 // runSSEHandler returns the HTTP handler for the AG-UI /run_sse endpoint.
@@ -364,7 +450,7 @@ func (l *aguiLauncher) runSSEHandler() http.Handler {
 
 		var req types.RunAgentInput
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			log.Printf("Error decoding AGUI request: %v", err)
+			log.Printf("agui: error decoding request: %v", err)
 			http.Error(w, "Invalid AGUI request payload", http.StatusBadRequest)
 			return
 		}
@@ -400,7 +486,7 @@ func (l *aguiLauncher) runSSEHandler() http.Handler {
 		defer func() {
 			for i := succeeded - 1; i >= 0; i-- {
 				if afterErr := l.config.interceptors[i].After(ctx, callCtx, handlerErr); afterErr != nil {
-					log.Printf("AGUI After interceptor error: %v", afterErr)
+					log.Printf("agui: After interceptor error: %v", afterErr)
 				}
 			}
 		}()
@@ -421,85 +507,11 @@ func (l *aguiLauncher) runSSEHandler() http.Handler {
 		}
 		userID := callCtx.User.Name
 
-		// Extract the last user message from the AG-UI request.
-		// AG-UI sends the full conversation history; we only need the latest user turn
-		// because ADK session service maintains its own history via threadID.
-		var msg *genai.Content
-		for i := len(req.Messages) - 1; i >= 0; i-- {
-			message := req.Messages[i]
-			if message.Role != types.RoleUser {
-				continue
-			}
+		// Resume runs carry FunctionResponses instead of a new user text turn.
+		isResumeRun := len(req.Resume) > 0
 
-			// Try multimodal array content first.
-			// Handles both the legacy "binary" format (flat fields) and the new
-			// typed formats ("image", "audio", "video", "document") which use a
-			// nested source object. The Go SDK currently only defines InputContentTypeText
-			// and InputContentTypeBinary; the new types are handled via the
-			// source.value / source.mimeType path extracted from the raw JSON
-			// (the Go SDK unmarshals unknown fields into the flat Data/URL/MimeType
-			// fields when they're present at the top level, but the new format
-			// nests them under "source" — so we fall back to the URL or Data
-			// field which the SDK populates from the raw JSON).
-			if inputContents, ok := message.ContentInputContents(); ok && len(inputContents) > 0 {
-				parts := make([]*genai.Part, len(inputContents))
-				for j, inputContent := range inputContents {
-					switch inputContent.Type {
-					case types.InputContentTypeText:
-						parts[j] = genai.NewPartFromText(inputContent.Text)
-					case types.InputContentTypeBinary:
-						// Legacy binary format: AG-UI sends base64 in Data field.
-						dataBytes, err := base64.StdEncoding.DecodeString(inputContent.Data)
-						if err != nil {
-							handlerErr = fmt.Errorf("failed to decode base64 binary data: %w", err)
-							http.Error(w, handlerErr.Error(), http.StatusBadRequest)
-							return
-						}
-						parts[j] = &genai.Part{
-							InlineData: &genai.Blob{
-								Data:        dataBytes,
-								MIMEType:    inputContent.MimeType,
-								DisplayName: inputContent.Filename,
-							},
-						}
-					default:
-						// New typed multimodal formats (image, audio, video, document).
-						// These use a source object: { type: "data"|"url", value, mimeType }.
-						// The Go SDK doesn't have a Source field yet, so the nested
-						// source data won't be in the flat InputContent fields.
-						// For now, check if Data or URL was populated (some SDK
-						// versions may flatten these) and fall back gracefully.
-						part, err := convertMultimodalInput(inputContent)
-						if err != nil {
-							handlerErr = fmt.Errorf("unsupported content type %q: %w", inputContent.Type, err)
-							http.Error(w, handlerErr.Error(), http.StatusBadRequest)
-							return
-						}
-						parts[j] = part
-					}
-				}
-				msg = genai.NewContentFromParts(parts, genai.RoleUser)
-				break
-			}
-
-			// Fall back to plain string content.
-			if contentStr, ok := message.ContentString(); ok && contentStr != "" {
-				msg = genai.NewContentFromText(contentStr, genai.RoleUser)
-				break
-			}
-
-			handlerErr = fmt.Errorf("unsupported content type: %T", message.Content)
-			http.Error(w, handlerErr.Error(), http.StatusBadRequest)
-			return
-		}
-
-		if msg == nil {
-			handlerErr = fmt.Errorf("no user message found in payload")
-			http.Error(w, handlerErr.Error(), http.StatusBadRequest)
-			return
-		}
-
-		// SSE commitment point: after this, errors become RunErrorEvent.
+		// SSE commitment point: after headers flush and RunStarted, protocol errors
+		// must be RunError on the stream (not HTTP 4xx), per AG-UI error handling.
 
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
@@ -514,25 +526,17 @@ func (l *aguiLauncher) runSSEHandler() http.Handler {
 
 		e := newEmitter(ctx, w, sse.NewSSEWriter(), l.config.interceptors[:succeeded], callCtx)
 
-		// finalizeLifecycle closes any open text messages, reasoning phases,
-		// and sub-agent steps. Must be called before any run-terminal event
-		// (RunFinished, RunError) to satisfy the AG-UI protocol requirement
-		// that all steps are closed before the run ends.
-		finalizeLifecycle := func() {
-			closeTextMessage(e, state)
-			closeReasoningMessage(e, state)
-			if state.currentStepAuthor != "" {
-				e.emit(events.NewStepFinishedEvent(state.currentStepAuthor))
-				state.currentStepAuthor = ""
-			}
-		}
-
 		// emitError sends a RunErrorEvent on the SSE stream and marks the run as
-		// finalized so that RunFinishedEvent is not also emitted.
-		emitError := func(errMsg string, opts ...events.RunErrorOption) {
-			finalizeLifecycle()
+		// finalized so that RunFinishedEvent is not also emitted. If a terminal
+		// event was already sent, it only records the error (no duplicate emit).
+		emitError := func(err error, opts ...events.RunErrorOption) {
+			handlerErr = err
+			if state.runFinalized {
+				return
+			}
+			finalizeLifecycle(e, state)
 			opts = append([]events.RunErrorOption{events.WithRunID(state.runID)}, opts...)
-			e.emit(events.NewRunErrorEvent(errMsg, opts...))
+			e.emit(events.NewRunErrorEvent(err.Error(), opts...))
 			state.runFinalized = true
 		}
 
@@ -542,18 +546,59 @@ func (l *aguiLauncher) runSSEHandler() http.Handler {
 			return
 		}
 
-		// TODO: Emit an initial StateSnapshotEvent here to establish baseline
-		// state for the client. The AG-UI spec recommends sending a snapshot at
-		// the start of an interaction so the frontend has the full state before
-		// any deltas arrive. To implement:
-		//   1. Load the session via config.SessionService (needs to be threaded
-		//      through from the handler method's launcher.Config).
-		//   2. Iterate session.State().All() to build a map[string]any.
-		//   3. Emit: e.emit(events.NewStateSnapshotEvent(stateMap))
-		// This is deferred because the session may not exist yet on the first
-		// run (AutoCreateSession creates it inside runner.Run), so the snapshot
-		// would need to come from the first event's session or a post-create
-		// callback.
+		// Load interrupts left open on a prior run for this thread (session id).
+		pending, err := l.loadPendingInterrupts(ctx, userID, sessionID)
+		if err != nil {
+			emitError(fmt.Errorf("failed to load pending interrupts: %w", err))
+			return
+		}
+
+		// Enforce AG-UI rules: pending threads require resume; cover all ids; schema/expiry.
+		if err := validateResumeAgainstPending(req.Resume, pending, time.Now()); err != nil {
+			emitError(err)
+			return
+		}
+
+		var reqState map[string]any
+		if stateMap, ok := req.State.(map[string]any); ok {
+			reqState = stateMap
+		}
+		state.userID = userID
+		state.runCtx = ctx
+		state.reqState = reqState
+
+		// Baseline state before deltas (AG-UI spec). Create session when missing so
+		// first-turn runs can still emit a snapshot before runner.Run.
+		snapSess, snapErr := l.ensureSessionForSnapshot(ctx, userID, sessionID, reqState)
+		if snapErr != nil {
+			emitError(fmt.Errorf("failed to prepare session for state snapshot: %w", snapErr))
+			return
+		}
+		emitStateSnapshotIfNonEmpty(e, buildStateSnapshot(snapSess, reqState))
+		// TODO(messages-snapshot-run-start): AG-UI recommends MESSAGES_SNAPSHOT when
+		// initializing or resyncing a conversation (see
+		// https://docs.ag-ui.com/concepts/messages#complete-snapshots) but only
+		// requires it before interrupt RunFinished (see
+		// https://docs.ag-ui.com/concepts/interrupts#state-at-the-interrupt-boundary).
+		// We emit MessagesSnapshot at interrupt boundaries only (stream.go emitInterrupt).
+		// Add run-start emission here if clients need full history on RunStarted without
+		// relying on prior interrupt snapshots or TEXT_MESSAGE_* streaming.
+
+		var msg *genai.Content
+		if isResumeRun {
+			// Map AG-UI resume[] → ADK adk_request_confirmation FunctionResponses.
+			msg, err = resumeEntriesToConfirmationContent(req.Resume)
+			if err != nil {
+				emitError(fmt.Errorf("invalid resume payload: %w", err))
+				return
+			}
+		} else {
+			msg, err = extractLastUserMessage(req.Messages)
+			if err != nil {
+				emitError(err)
+				return
+			}
+		}
 
 		// Stream ADK events, mapping each to AG-UI protocol events.
 		cfg := agent.RunConfig{
@@ -571,8 +616,7 @@ func (l *aguiLauncher) runSSEHandler() http.Handler {
 
 		for ev, err := range l.runner.Run(ctx, userID, sessionID, msg, cfg, runOpts...) {
 			if err != nil {
-				emitError(err.Error())
-				handlerErr = err
+				emitError(err)
 				break
 			}
 			if ev == nil {
@@ -584,15 +628,13 @@ func (l *aguiLauncher) runSSEHandler() http.Handler {
 				if ev.ErrorCode != "" {
 					opts = append(opts, events.WithErrorCode(ev.ErrorCode))
 				}
-				emitError(ev.ErrorMessage, opts...)
-				handlerErr = fmt.Errorf("%s", ev.ErrorMessage)
+				emitError(fmt.Errorf("%s", ev.ErrorMessage), opts...)
 				break
 			}
 
 			done, err := l.processEvent(e, ev, state)
 			if err != nil {
-				emitError(err.Error())
-				handlerErr = err
+				emitError(err)
 				break
 			}
 			if done {
@@ -600,35 +642,33 @@ func (l *aguiLauncher) runSSEHandler() http.Handler {
 			}
 		}
 
-		// TODO: Implement AG-UI interrupt resume protocol.
-		// The emit half is done: adk_request_confirmation FunctionCalls are
-		// detected and converted to RunFinished { outcome: { type: "interrupt" } }
-		// with the original tool call emitted as ToolCallStart/Args/End for
-		// the audit trail. The resume half requires:
-		//   1. The AG-UI Go SDK to add a `Resume` field to RunAgentInput
-		//      ([]ResumeEntry with interruptId, status, and payload).
-		//   2. On a resumed run, extract req.Resume entries and for each:
-		//      a. Look up the ADK confirmation call ID from the interrupt's
-		//         metadata["adk"]["confirmationCallId"].
-		//      b. Build a genai.FunctionResponse with:
-		//           Name: toolconfirmation.FunctionCallName
-		//           ID:   confirmationCallId
-		//           Response: map[string]any{
-		//             "confirmed": payload["approved"],
-		//             "payload":   payload (or payload["editedArgs"]),
-		//           }
-		//      c. Inject the FunctionResponse into the ADK session as a user
-		//         content event and restart the runner.
-		//   3. Cancelled resumes (status: "cancelled") should map to
-		//      confirmed=false with no payload.
-		// See: https://docs.ag-ui.com/concepts/interrupts
-
 		// Close any open lifecycle events before finalizing the run.
-		finalizeLifecycle()
+		finalizeLifecycle(e, state)
 
 		// Emit RunFinishedEvent only if no terminal event (RunError) was already sent.
 		if !state.runFinalized {
-			e.emit(events.NewRunFinishedEvent(state.threadID, state.runID))
+			e.emit(events.NewRunFinishedEventWithOptions(
+				state.threadID,
+				state.runID,
+				events.WithSuccessOutcome(),
+			))
+			state.runFinalized = true
+		}
+
+		// Persist or clear pending interrupts for the next run on this thread.
+		// The terminal SSE event has already been emitted, so failures here are
+		// logged rather than sent as RunError (which would duplicate the terminal).
+		switch {
+		case len(state.emittedInterrupts) > 0:
+			if err := l.persistPendingInterrupts(ctx, userID, sessionID, state.emittedInterrupts); err != nil {
+				log.Printf("agui: failed to persist pending interrupts: %v", err)
+				handlerErr = err
+			}
+		case handlerErr == nil:
+			if err := l.clearPendingInterrupts(ctx, userID, sessionID); err != nil {
+				log.Printf("agui: failed to clear pending interrupts: %v", err)
+				handlerErr = err
+			}
 		}
 	})
 }

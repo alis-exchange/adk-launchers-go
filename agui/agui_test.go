@@ -106,6 +106,51 @@ func TestConvertMultimodalInput(t *testing.T) {
 		}
 	})
 
+	t.Run("source data", func(t *testing.T) {
+		data := base64.StdEncoding.EncodeToString([]byte("hello"))
+		ic := types.InputContent{
+			Type: types.InputContentTypeImage,
+			Source: &types.InputContentSource{
+				Type:     types.InputContentSourceTypeData,
+				Value:    data,
+				MimeType: "image/png",
+			},
+		}
+		part, err := convertMultimodalInput(ic)
+		if err != nil {
+			t.Fatalf("convertMultimodalInput() error = %v", err)
+		}
+		if part.InlineData == nil {
+			t.Fatal("expected InlineData to be set")
+		}
+		if string(part.InlineData.Data) != "hello" {
+			t.Errorf("InlineData.Data = %q, want 'hello'", part.InlineData.Data)
+		}
+		if part.InlineData.MIMEType != "image/png" {
+			t.Errorf("InlineData.MIMEType = %v, want image/png", part.InlineData.MIMEType)
+		}
+	})
+
+	t.Run("source url", func(t *testing.T) {
+		ic := types.InputContent{
+			Type: types.InputContentTypeImage,
+			Source: &types.InputContentSource{
+				Type:  types.InputContentSourceTypeURL,
+				Value: "https://example.com/img.png",
+			},
+		}
+		part, err := convertMultimodalInput(ic)
+		if err != nil {
+			t.Fatalf("convertMultimodalInput() error = %v", err)
+		}
+		if part.FileData == nil {
+			t.Fatal("expected FileData to be set")
+		}
+		if part.FileData.FileURI != "https://example.com/img.png" {
+			t.Errorf("FileData.FileURI = %v, want https://example.com/img.png", part.FileData.FileURI)
+		}
+	})
+
 	t.Run("no data or url", func(t *testing.T) {
 		ic := types.InputContent{
 			Type:     "image",
@@ -113,7 +158,7 @@ func TestConvertMultimodalInput(t *testing.T) {
 		}
 		_, err := convertMultimodalInput(ic)
 		if err == nil {
-			t.Error("expected error when no data or url")
+			t.Error("expected error when no data, url, or source")
 		}
 	})
 

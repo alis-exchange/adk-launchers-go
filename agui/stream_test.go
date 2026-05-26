@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
+	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/encoding/sse"
 	"google.golang.org/adk/session"
 	"google.golang.org/adk/tool/toolconfirmation"
@@ -48,20 +49,6 @@ func parseSSEEvents(body string) []sseEvent {
 		out = append(out, sseEvent{Type: events.EventType(typ), Raw: raw})
 	}
 	return out
-}
-
-// newTestEmitter creates an emitter backed by an httptest.Recorder so we can
-// inspect the SSE output after processing.
-func newTestEmitter() (*emitter, *httptest.ResponseRecorder) {
-	rec := httptest.NewRecorder()
-	return newEmitter(context.Background(), rec, sse.NewSSEWriter(), nil, nil), rec
-}
-
-// newTestLauncher creates a minimal aguiLauncher for testing processEvent.
-func newTestLauncher(appName string) *aguiLauncher {
-	return &aguiLauncher{
-		config: &AGUIConfig{appName: appName},
-	}
 }
 
 func TestProcessEvent_TextStreaming(t *testing.T) {
@@ -394,19 +381,20 @@ func TestProcessEvent_ConfirmationInterrupt(t *testing.T) {
 		t.Errorf("event[2].Type = %v, want TOOL_CALL_END", evts[2].Type)
 	}
 
-	// Fourth event: RunFinished with interrupt outcome.
-	if evts[3].Type != events.EventTypeRunFinished {
-		t.Errorf("event[3].Type = %v, want RUN_FINISHED", evts[3].Type)
+	// Last event: RunFinished with interrupt outcome.
+	last := len(evts) - 1
+	if evts[last].Type != events.EventTypeRunFinished {
+		t.Errorf("event[%d].Type = %v, want RUN_FINISHED", last, evts[last].Type)
 	}
-	if evts[3].str("threadId") != "t1" {
-		t.Errorf("event[3].threadId = %v, want t1", evts[3].str("threadId"))
+	if evts[last].str("threadId") != "t1" {
+		t.Errorf("event[%d].threadId = %v, want t1", last, evts[last].str("threadId"))
 	}
-	if evts[3].str("runId") != "r1" {
-		t.Errorf("event[3].runId = %v, want r1", evts[3].str("runId"))
+	if evts[last].str("runId") != "r1" {
+		t.Errorf("event[%d].runId = %v, want r1", last, evts[last].str("runId"))
 	}
-	outcomeRaw, ok := evts[3].Raw["outcome"]
+	outcomeRaw, ok := evts[last].Raw["outcome"]
 	if !ok || outcomeRaw == nil {
-		t.Fatal("event[3].outcome is missing, want interrupt outcome")
+		t.Fatal("RunFinished outcome is missing, want interrupt outcome")
 	}
 
 	// Re-marshal and unmarshal the outcome to verify structure.
@@ -414,17 +402,20 @@ func TestProcessEvent_ConfirmationInterrupt(t *testing.T) {
 	if err2 != nil {
 		t.Fatalf("failed to marshal outcome: %v", err2)
 	}
-	var outcome interruptOutcome
+	var outcome events.RunFinishedOutcome
 	if err2 := json.Unmarshal(outcomeBytes, &outcome); err2 != nil {
 		t.Fatalf("failed to unmarshal outcome: %v", err2)
 	}
-	if outcome.Type != "interrupt" {
+	if outcome.Type != events.RunFinishedOutcomeTypeInterrupt {
 		t.Errorf("outcome.Type = %v, want interrupt", outcome.Type)
 	}
 	if len(outcome.Interrupts) != 1 {
 		t.Fatalf("len(outcome.Interrupts) = %d, want 1", len(outcome.Interrupts))
 	}
 	intr := outcome.Interrupts[0]
+	if intr.ID != "confirm-1" {
+		t.Errorf("interrupt.ID = %v, want confirm-1 (confirmation call ID)", intr.ID)
+	}
 	if intr.Reason != "tool_call" {
 		t.Errorf("interrupt.Reason = %v, want tool_call", intr.Reason)
 	}
@@ -481,7 +472,7 @@ func TestProcessEvent_ConfirmationInterrupt_TypedHint(t *testing.T) {
 	// Parse the RunFinished outcome to check hint extraction.
 	last := evts[len(evts)-1]
 	outcomeBytes, _ := json.Marshal(last.Raw["outcome"])
-	var outcome interruptOutcome
+	var outcome events.RunFinishedOutcome
 	if err := json.Unmarshal(outcomeBytes, &outcome); err != nil {
 		t.Fatalf("failed to unmarshal outcome: %v", err)
 	}
@@ -661,95 +652,203 @@ func TestProcessEvent_GenAIPartConverter(t *testing.T) {
 	})
 }
 
-func TestRunFinishedInterruptEvent_Validate(t *testing.T) {
-	tests := []struct {
-		name    string
-		event   runFinishedInterruptEvent
-		wantErr bool
-	}{
-		{
-			name: "valid",
-			event: runFinishedInterruptEvent{
-				BaseEvent:     events.NewBaseEvent(events.EventTypeRunFinished),
-				ThreadIDValue: "t1",
-				RunIDValue:    "r1",
-				Outcome: &interruptOutcome{
-					Type:       "interrupt",
-					Interrupts: []interrupt{{ID: "i1", Reason: "tool_call"}},
-				},
-			},
-			wantErr: false,
-		},
-		{
-			name: "missing threadId",
-			event: runFinishedInterruptEvent{
-				BaseEvent:  events.NewBaseEvent(events.EventTypeRunFinished),
-				RunIDValue: "r1",
-				Outcome: &interruptOutcome{
-					Type:       "interrupt",
-					Interrupts: []interrupt{{ID: "i1", Reason: "tool_call"}},
-				},
-			},
-			wantErr: true,
-		},
-		{
-			name: "missing runId",
-			event: runFinishedInterruptEvent{
-				BaseEvent:     events.NewBaseEvent(events.EventTypeRunFinished),
-				ThreadIDValue: "t1",
-				Outcome: &interruptOutcome{
-					Type:       "interrupt",
-					Interrupts: []interrupt{{ID: "i1", Reason: "tool_call"}},
-				},
-			},
-			wantErr: true,
-		},
-		{
-			name: "nil outcome",
-			event: runFinishedInterruptEvent{
-				BaseEvent:     events.NewBaseEvent(events.EventTypeRunFinished),
-				ThreadIDValue: "t1",
-				RunIDValue:    "r1",
-			},
-			wantErr: true,
-		},
-		{
-			name: "empty interrupts",
-			event: runFinishedInterruptEvent{
-				BaseEvent:     events.NewBaseEvent(events.EventTypeRunFinished),
-				ThreadIDValue: "t1",
-				RunIDValue:    "r1",
-				Outcome:       &interruptOutcome{Type: "interrupt"},
-			},
-			wantErr: true,
-		},
+func TestRunFinishedEvent_WithSuccessOutcome_ToJSON(t *testing.T) {
+	ev := events.NewRunFinishedEventWithOptions("t1", "r1", events.WithSuccessOutcome())
+	data, err := ev.ToJSON()
+	if err != nil {
+		t.Fatalf("ToJSON() error = %v", err)
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := tt.event.Validate()
-			if (err != nil) != tt.wantErr {
-				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
-			}
-		})
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	outcome, ok := raw["outcome"].(map[string]any)
+	if !ok {
+		t.Fatal("outcome missing")
+	}
+	if outcome["type"] != "success" {
+		t.Errorf("outcome.type = %v, want success", outcome["type"])
 	}
 }
 
-func TestRunFinishedInterruptEvent_ToJSON(t *testing.T) {
-	ev := &runFinishedInterruptEvent{
-		BaseEvent:     events.NewBaseEvent(events.EventTypeRunFinished),
-		ThreadIDValue: "t1",
-		RunIDValue:    "r1",
-		Outcome: &interruptOutcome{
-			Type: "interrupt",
-			Interrupts: []interrupt{{
-				ID:         "i1",
-				Reason:     "tool_call",
-				Message:    "approve?",
-				ToolCallID: "tc-1",
-			}},
-		},
+func TestProcessEvent_ConfirmationInterrupt_EmitsSnapshots(t *testing.T) {
+	svc := session.InMemoryService()
+	ctx := context.Background()
+	createResp, err := svc.Create(ctx, &session.CreateRequest{
+		AppName:   "test-app",
+		UserID:    "user-1",
+		SessionID: "t1",
+		State:     map[string]any{"count": 1},
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
 	}
+	ev0 := session.NewEvent("inv0")
+	ev0.Content = genai.NewContentFromText("Hello", genai.RoleUser)
+	if err := svc.AppendEvent(ctx, createResp.Session, ev0); err != nil {
+		t.Fatalf("AppendEvent() error = %v", err)
+	}
+
+	l := newTestLauncher("test-app", svc)
+	e, rec := newTestEmitter()
+	state := &streamState{
+		runID: "r1", threadID: "t1", userID: "user-1", runCtx: ctx,
+		reqState: map[string]any{"ui": "panel"},
+	}
+
+	ev := session.NewEvent("inv1")
+	ev.Content = &genai.Content{
+		Role: string(genai.RoleModel),
+		Parts: []*genai.Part{{
+			FunctionCall: &genai.FunctionCall{
+				ID:   "confirm-1",
+				Name: toolconfirmation.FunctionCallName,
+				Args: map[string]any{
+					"originalFunctionCall": map[string]any{
+						"ID":   "orig-fc-1",
+						"Name": "send_email",
+						"Args": map[string]any{},
+					},
+				},
+			},
+		}},
+	}
+	done, err := l.processEvent(e, ev, state)
+	if err != nil || !done {
+		t.Fatalf("processEvent() done=%v err=%v", done, err)
+	}
+
+	evts := parseSSEEvents(rec.Body.String())
+	// ToolCallStart, ToolCallArgs, ToolCallEnd, StateSnapshot, MessagesSnapshot, RunFinished
+	if len(evts) < 6 {
+		t.Fatalf("got %d events, want at least 6 (with snapshots)", len(evts))
+	}
+	foundState, foundMsgs, foundFinished := false, false, false
+	for _, evt := range evts {
+		switch evt.Type {
+		case events.EventTypeStateSnapshot:
+			foundState = true
+		case events.EventTypeMessagesSnapshot:
+			foundMsgs = true
+		case events.EventTypeRunFinished:
+			foundFinished = true
+		}
+	}
+	if !foundState {
+		t.Error("missing STATE_SNAPSHOT before RunFinished")
+	}
+	if !foundMsgs {
+		t.Error("missing MESSAGES_SNAPSHOT before RunFinished")
+	}
+	if !foundFinished {
+		t.Fatal("missing RUN_FINISHED")
+	}
+	// Both snapshot types must precede RunFinished.
+	stateBeforeFinished, msgsBeforeFinished := false, false
+	for _, evt := range evts {
+		if evt.Type == events.EventTypeRunFinished {
+			break
+		}
+		if evt.Type == events.EventTypeStateSnapshot {
+			stateBeforeFinished = true
+		}
+		if evt.Type == events.EventTypeMessagesSnapshot {
+			msgsBeforeFinished = true
+		}
+	}
+	if !stateBeforeFinished {
+		t.Error("STATE_SNAPSHOT must precede RUN_FINISHED")
+	}
+	if !msgsBeforeFinished {
+		t.Error("MESSAGES_SNAPSHOT must precede RUN_FINISHED")
+	}
+}
+
+func TestInterrupt_PersistFailure_NoDoubleTerminal(t *testing.T) {
+	svc := session.InMemoryService()
+	ctx := context.Background()
+	createResp, err := svc.Create(ctx, &session.CreateRequest{
+		AppName:   "test-app",
+		UserID:    "user-1",
+		SessionID: "t1",
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	ev0 := session.NewEvent("inv0")
+	ev0.Content = genai.NewContentFromText("Hello", genai.RoleUser)
+	if err := svc.AppendEvent(ctx, createResp.Session, ev0); err != nil {
+		t.Fatalf("AppendEvent() error = %v", err)
+	}
+
+	// Wrap the real service so AppendEvent (used by persistPendingInterrupts) fails.
+	failSvc := &failAppendService{Service: svc, appendErr: fmt.Errorf("storage unavailable")}
+	l := newTestLauncher("test-app", failSvc)
+	e, rec := newTestEmitter()
+	state := &streamState{
+		runID: "r1", threadID: "t1", userID: "user-1", runCtx: ctx,
+	}
+
+	// Process a confirmation event → emitInterrupt emits RunFinished with interrupt outcome.
+	ev := session.NewEvent("inv1")
+	ev.Content = &genai.Content{
+		Role: string(genai.RoleModel),
+		Parts: []*genai.Part{{
+			FunctionCall: &genai.FunctionCall{
+				ID:   "confirm-1",
+				Name: toolconfirmation.FunctionCallName,
+				Args: map[string]any{
+					"originalFunctionCall": map[string]any{
+						"ID":   "orig-fc-1",
+						"Name": "send_email",
+						"Args": map[string]any{},
+					},
+				},
+			},
+		}},
+	}
+	done, err := l.processEvent(e, ev, state)
+	if err != nil || !done {
+		t.Fatalf("processEvent() done=%v err=%v", done, err)
+	}
+	if !state.runFinalized {
+		t.Fatal("expected runFinalized=true after interrupt")
+	}
+
+	// Simulate what runSSEHandler does after the event loop: persist fails.
+	persistErr := l.persistPendingInterrupts(ctx, "user-1", "t1", state.emittedInterrupts)
+	if persistErr == nil {
+		t.Fatal("expected persist to fail with failAppendService")
+	}
+
+	// The key assertion: the SSE stream must contain exactly one terminal event
+	// (RunFinished with interrupt outcome). No RunError should appear.
+	evts := parseSSEEvents(rec.Body.String())
+	terminalCount := 0
+	for _, evt := range evts {
+		if evt.Type == events.EventTypeRunFinished || evt.Type == events.EventTypeRunError {
+			terminalCount++
+		}
+	}
+	if terminalCount != 1 {
+		t.Errorf("expected exactly 1 terminal event, got %d", terminalCount)
+		for i, evt := range evts {
+			t.Logf("  event[%d]: %s", i, evt.Type)
+		}
+	}
+}
+
+func TestRunFinishedEvent_WithInterruptOutcome_ToJSON(t *testing.T) {
+	ev := events.NewRunFinishedEventWithOptions(
+		"t1",
+		"r1",
+		events.WithInterruptOutcome([]types.Interrupt{{
+			ID:         "i1",
+			Reason:     "tool_call",
+			Message:    "approve?",
+			ToolCallID: "tc-1",
+		}}),
+	)
 
 	data, err := ev.ToJSON()
 	if err != nil {

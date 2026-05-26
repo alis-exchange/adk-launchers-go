@@ -14,6 +14,8 @@
 //     (keyword: agui).
 //   - [lro] — HTTP resume callbacks for go.alis.build/lro/v2 long-running operations,
 //     invoked by Cloud Tasks (keyword: lro).
+//   - [scheduler] — A2A scheduler extension HTTP (cron JSON-RPC and execution callback;
+//     in-process ADK cron execution; keyword: scheduler).
 //
 // Shared implementation helpers live under internal/launcherutils and are not part of
 // the public import path.
@@ -28,15 +30,19 @@
 //	import (
 //	    "go.alis.build/adk/launchers/agui"
 //	    "go.alis.build/adk/launchers/lro"
+//	    "go.alis.build/adk/launchers/scheduler"
+//	    launchersweb "go.alis.build/adk/launchers/web"
 //	    weblauncher "google.golang.org/adk/cmd/launcher/web"
 //	)
 //
-//	web := weblauncher.NewLauncher(
+//	web := launchersweb.NewLauncher(
+//	    weblauncher.NewLauncher(),
 //	    agui.NewLauncher("my-agent"),
 //	    lro.NewLauncher(lro.WithServiceID("my-service")),
+//	    scheduler.NewLauncher(schedSvc, "my-agent"),
 //	)
 //
 // At runtime, enable sublaunchers by keyword on the adk web command line:
 //
-//	adk web --port 8080 agui lro -service_id=my-service
+//	adk web --port 8080 agui lro scheduler -service_id=my-service -app_name=my-agent
 package launchers

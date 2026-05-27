@@ -110,9 +110,18 @@ func (rt *Runtime) RunSSE(ctx context.Context, req RunRequest) (string, iter.Seq
 		appName = rt.appName
 	}
 
+	sessionService := rt.launcherCfg.SessionService
+	memoryService := rt.launcherCfg.MemoryService
+	artifactService := rt.launcherCfg.ArtifactService
+	pluginConfig := rt.launcherCfg.PluginConfig
+
 	sessionID := req.SessionID
 	if sessionID == "" {
-		sessionID = uuid.NewString()
+		// Vertex AI memory bank does not currently support hyphens in session IDs.
+		// Therefore we replace all hyphens with empty strings.
+		// TODO: Remove this once Vertex AI memory bank supports hyphens.
+		// See: https://github.com/googleapis/google-cloud-go/issues/14656
+		sessionID = strings.ReplaceAll(uuid.NewString(), "-", "")
 	}
 
 	curAgent, err := rt.launcherCfg.AgentLoader.LoadAgent(appName)
@@ -126,10 +135,10 @@ func (rt *Runtime) RunSSE(ctx context.Context, req RunRequest) (string, iter.Seq
 	r, err := runner.New(runner.Config{
 		AppName:           appName,
 		Agent:             curAgent,
-		SessionService:    rt.launcherCfg.SessionService,
-		MemoryService:     rt.launcherCfg.MemoryService,
-		ArtifactService:   rt.launcherCfg.ArtifactService,
-		PluginConfig:      rt.launcherCfg.PluginConfig,
+		SessionService:    sessionService,
+		MemoryService:     memoryService,
+		ArtifactService:   artifactService,
+		PluginConfig:      pluginConfig,
 		AutoCreateSession: true,
 	})
 	if err != nil {

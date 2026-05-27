@@ -18,12 +18,13 @@ import (
 	alismux "go.alis.build/mux"
 	adklauncher "google.golang.org/adk/cmd/launcher"
 	adkweb "google.golang.org/adk/cmd/launcher/web"
+	"google.golang.org/grpc"
 )
 
 // Launcher is the public surface of [NewLauncher].
 //
-// Hosts compose it with [go.alis.build/adk/launchers/web.NewLauncher] and call
-// [Launcher.SchedulerService] when registering gRPC on the host server.
+// Hosts compose it with [go.alis.build/adk/launchers/web.NewLauncher]. For gRPC, use
+// [WithGRPCRegistrar] or call [Launcher.SchedulerService] with schedulerext.RegisterGRPC.
 type Launcher interface {
 	adkweb.Sublauncher
 	launchersweb.HostRouteSetup
@@ -69,6 +70,22 @@ func WithCronObserver(observer CronObserver) Option {
 	}
 }
 
+// WithGRPCRegistrar registers SchedulerService on reg during [SetupHostRoutes].
+//
+// Pass the host's grpc.Server (it implements [grpc.ServiceRegistrar]). The host must
+// still mount that server on go.alis.build/mux (for example hostmux.HandleGRPC) and
+// add [schedulerservice.UnaryServerInterceptor] (iam.UnaryInterceptor) so that caller
+// identity is available to service methods. Do not also call schedulerext.RegisterGRPC
+// for the same service instance.
+func WithGRPCRegistrar(reg grpc.ServiceRegistrar) Option {
+	if reg == nil {
+		panic("scheduler: WithGRPCRegistrar requires a non-nil ServiceRegistrar")
+	}
+	return func(l *schedulerLauncher) {
+		l.grpcRegistrar = reg
+	}
+}
+
 // schedulerLauncher implements [Launcher] and mounts scheduler routes on the host mux.
 type schedulerLauncher struct {
 	// flags holds CLI flags for the "scheduler" sublauncher keyword.
@@ -81,6 +98,8 @@ type schedulerLauncher struct {
 	cronCfg cronConfig
 	// jsonrpcOpts are forwarded to schedulerext.RegisterHTTP for the JSON-RPC surface.
 	jsonrpcOpts []schedjsonrpc.JSONRPCHandlerOption
+	// grpcRegistrar when set triggers schedulerext.RegisterGRPC in [SetupHostRoutes].
+	grpcRegistrar grpc.ServiceRegistrar
 
 	// setupOnce ensures mountHostRoutes runs at most once per launcher instance.
 	setupOnce sync.Once
@@ -99,9 +118,11 @@ var (
 // svc must be constructed by the host (Spanner, Cloud Tasks, TargetUrl, etc.).
 // appName is the ADK app to run when a cron fires (-app_name flag overrides at CLI).
 //
-// Register gRPC separately on your server:
+// Optional gRPC: [WithGRPCRegistrar] during [SetupHostRoutes], or register manually:
 //
 //	schedulerext.RegisterGRPC(grpcServer, l.SchedulerService())
+//
+// The host still calls hostmux.HandleGRPC(grpcServer) once per process.
 func NewLauncher(appName string, svc *schedulerservice.SchedulerService, opts ...Option) Launcher {
 	l := &schedulerLauncher{service: svc, appName: appName}
 	for _, opt := range opts {
@@ -180,6 +201,8 @@ func (l *schedulerLauncher) mountHostRoutes(config *adklauncher.Config) error {
 		return fmt.Errorf("scheduler: %w", err)
 	}
 
+	l.registerGRPC()
+
 	// WithoutHandler skips the stock A2A loopback handler; we mount our ADK handler below.
 	httpOpts := []schedulerext.HTTPOption{schedulerext.WithoutHandler()}
 	if len(l.jsonrpcOpts) > 0 {
@@ -189,6 +212,27 @@ func (l *schedulerLauncher) mountHostRoutes(config *adklauncher.Config) error {
 
 	alismux.SystemPost(schedulerext.HandlerPath, cronHandler(l.service, rt, systemIdentity, &l.cronCfg))
 	return nil
+}
+
+const schedulerGRPCServiceName = "alis.a2a.extension.scheduler.v1.SchedulerService"
+
+// serviceInfoProvider is satisfied by *grpc.Server but not by grpc.ServiceRegistrar,
+// allowing a pre-registration check without importing a concrete type.
+type serviceInfoProvider interface {
+	GetServiceInfo() map[string]grpc.ServiceInfo
+}
+
+// registerGRPC wires SchedulerService into grpcRegistrar when [WithGRPCRegistrar] was used.
+func (l *schedulerLauncher) registerGRPC() {
+	if l.grpcRegistrar == nil {
+		return
+	}
+	if si, ok := l.grpcRegistrar.(serviceInfoProvider); ok {
+		if _, exists := si.GetServiceInfo()[schedulerGRPCServiceName]; exists {
+			return
+		}
+	}
+	schedulerext.RegisterGRPC(l.grpcRegistrar, l.service)
 }
 
 // muxRegistrar adapts schedulerext.RegisterHTTP to go.alis.build/mux route registration.

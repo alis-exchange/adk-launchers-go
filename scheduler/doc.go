@@ -16,7 +16,11 @@
 //
 //   - Build [schedulerservice.SchedulerService] (Spanner, Cloud Tasks queue, TargetUrl, etc.).
 //   - Pass the service and ADK app name to [NewLauncher].
-//   - Register gRPC: schedulerext.RegisterGRPC(grpcServer, l.SchedulerService()).
+//   - Mount native gRPC on the host mux (hostmux.HandleGRPC or SystemHandleGRPC).
+//   - Register SchedulerService on the host grpc.Server via [WithGRPCRegistrar], or
+//     schedulerext.RegisterGRPC(grpcServer, l.SchedulerService()) manually (not both).
+//   - Add [schedulerservice.UnaryServerInterceptor] to the grpc.Server so caller
+//     identity (iam/v3) is available to SchedulerService methods.
 //   - Compose the launcher: launchersweb.NewLauncher(..., scheduler.NewLauncher(...)).
 //   - Provide [WithCronIdentity] (recommended) or set ALIS_OS_PROJECT for the default SA.
 //
@@ -44,25 +48,32 @@
 //   - [WithJSONRPCOptions] — forwarded to the extension JSON-RPC handler (e.g. CORS).
 //   - [WithSynchronousExecution] — sync ADK run; 500 on agent failure, 200 on persist failure.
 //   - [WithCronObserver] — lifecycle hooks around in-process execution.
+//   - [WithGRPCRegistrar] — register SchedulerService on the host grpc.Server during setup.
 //
 // # Example
 //
 //	import (
-//	    schedulerext "go.alis.build/a2a/extension/scheduler"
+//	    schedulerservice "go.alis.build/a2a/extension/scheduler/service"
 //	    "go.alis.build/adk/launchers/scheduler"
 //	    launchersweb "go.alis.build/adk/launchers/web"
 //	    "go.alis.build/iam/v3"
+//	    hostmux "go.alis.build/mux"
+//	    "google.golang.org/grpc"
 //	)
 //
-//	sched := scheduler.NewLauncher(svc, "my.agent",
+//	grpcServer := grpc.NewServer(
+//	    grpc.UnaryInterceptor(schedulerservice.UnaryServerInterceptor()),
+//	)
+//	sched := scheduler.NewLauncher("my.agent", svc,
 //	    scheduler.WithCronIdentity(&iam.Identity{
 //	        ID:    "alis-build@my-project.iam.gserviceaccount.com",
 //	        Email: "alis-build@my-project.iam.gserviceaccount.com",
 //	        Type:  iam.ServiceAccount,
 //	    }),
+//	    scheduler.WithGRPCRegistrar(grpcServer),
 //	)
 //	launchersweb.NewLauncher(webapi.NewLauncher(), sched)
-//	schedulerext.RegisterGRPC(grpcServer, sched.SchedulerService())
+//	hostmux.HandleGRPC(grpcServer)
 //
 // CLI: adk web --port 8080 api scheduler -app_name=my.agent
 package scheduler

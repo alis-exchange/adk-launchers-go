@@ -18,7 +18,6 @@ Import the sublaunchers you need and pass them to [`web.NewLauncher`](./web):
 
 ```go
 import (
-    schedulerext "go.alis.build/a2a/extension/scheduler"
     schedulerservice "go.alis.build/a2a/extension/scheduler/service"
 
     "go.alis.build/adk/launchers/agui"
@@ -26,7 +25,9 @@ import (
     "go.alis.build/adk/launchers/scheduler"
     launchersweb "go.alis.build/adk/launchers/web"
     "go.alis.build/iam/v3"
+    hostmux "go.alis.build/mux"
     weblauncher "google.golang.org/adk/cmd/launcher/web"
+    "google.golang.org/grpc"
 )
 
 // Host constructs SchedulerService (Spanner, Cloud Tasks, etc.) — see scheduler/doc.go.
@@ -35,23 +36,27 @@ if err != nil {
     log.Fatal(err)
 }
 
+grpcServer := grpc.NewServer(
+    grpc.UnaryInterceptor(schedulerservice.UnaryServerInterceptor()),
+)
+
 web := launchersweb.NewLauncher(
     weblauncher.NewLauncher(),
     agui.NewLauncher("my-agent", agui.WithCORS(agui.CORSConfig{
         AllowedOrigins: []string{"http://localhost:3000"},
     })),
     lro.NewLauncher(lro.WithServiceID("my-service")),
-    scheduler.NewLauncher(schedSvc, "my-agent",
+    scheduler.NewLauncher("my-agent", schedSvc,
         scheduler.WithCronIdentity(&iam.Identity{
             ID:    "alis-build@my-project.iam.gserviceaccount.com",
             Email: "alis-build@my-project.iam.gserviceaccount.com",
             Type:  iam.ServiceAccount,
         }),
+        scheduler.WithGRPCRegistrar(grpcServer),
     ),
 )
 
-// Register scheduler gRPC on your server (not done by the sublauncher).
-schedulerext.RegisterGRPC(grpcServer, schedSvc)
+hostmux.HandleGRPC(grpcServer)
 ```
 
 At runtime, activate sublaunchers by keyword on the `adk web` command line, for example:

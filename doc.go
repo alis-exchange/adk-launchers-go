@@ -39,7 +39,7 @@
 //	    weblauncher.NewLauncher(),
 //	    agui.NewLauncher("my-agent"),
 //	    lro.NewLauncher(lro.WithServiceID("my-service")),
-//	    scheduler.NewLauncher(schedSvc, "my-agent"),
+//	    scheduler.NewLauncher("my-agent", schedSvc),
 //	)
 //
 // At runtime, enable sublaunchers by keyword on the adk web command line:

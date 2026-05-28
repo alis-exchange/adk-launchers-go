@@ -9,29 +9,28 @@ import (
 func TestOwnerFromCron(t *testing.T) {
 	t.Parallel()
 
-	_, err := ownerFromCron(&pb.Cron{Name: "crons/x", Owner: ""})
-	if err == nil {
-		t.Fatal("expected error for empty owner")
+	tests := []struct {
+		name    string
+		owner   string
+		wantID  string
+		wantErr bool
+	}{
+		{"empty owner", "", "", true},
+		{"malformed owner", "users", "", true},
+		{"non-users prefix", "groups/alice", "", true},
+		{"missing users prefix", "/alice", "", true},
+		{"valid owner", "users/alice", "alice", false},
 	}
-
-	_, err = ownerFromCron(&pb.Cron{Name: "crons/x", Owner: "users"})
-	if err == nil {
-		t.Fatal("expected error for malformed owner")
-	}
-
-	_, err = ownerFromCron(&pb.Cron{Name: "crons/x", Owner: "groups/alice"})
-	if err == nil {
-		t.Fatal("expected error for non-users/ prefix")
-	}
-
-	_, err = ownerFromCron(&pb.Cron{Name: "crons/x", Owner: "/alice"})
-	if err == nil {
-		t.Fatal("expected error for missing users prefix")
-	}
-
-	id, err := ownerFromCron(&pb.Cron{Name: "crons/x", Owner: "users/alice"})
-	if err != nil || id != "alice" {
-		t.Fatalf("owner = %q err = %v", id, err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			id, err := ownerFromCron(&pb.Cron{Name: "crons/x", Owner: tt.owner})
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ownerFromCron(%q) error = %v, wantErr %v", tt.owner, err, tt.wantErr)
+			}
+			if !tt.wantErr && id != tt.wantID {
+				t.Fatalf("ownerFromCron(%q) = %q, want %q", tt.owner, id, tt.wantID)
+			}
+		})
 	}
 }
 

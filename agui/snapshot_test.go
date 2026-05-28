@@ -32,14 +32,23 @@ func TestBuildStateSnapshot_OmitsInternalKeys(t *testing.T) {
 }
 
 func TestIsInternalStateKey(t *testing.T) {
-	if !isInternalStateKey(pendingInterruptsStateKey) {
-		t.Error("pending key should be internal")
+	tests := []struct {
+		key  string
+		want bool
+	}{
+		{pendingInterruptsStateKey, true},
+		{"_agui_foo", true},
+		{"_agui_", true},
+		{"userVisible", false},
+		{"count", false},
+		{"", false},
 	}
-	if !isInternalStateKey("_agui_foo") {
-		t.Error("_agui_ prefix should be internal")
-	}
-	if isInternalStateKey("userVisible") {
-		t.Error("user key should not be internal")
+	for _, tt := range tests {
+		t.Run(tt.key, func(t *testing.T) {
+			if got := isInternalStateKey(tt.key); got != tt.want {
+				t.Errorf("isInternalStateKey(%q) = %v, want %v", tt.key, got, tt.want)
+			}
+		})
 	}
 }
 

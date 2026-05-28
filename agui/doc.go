@@ -6,14 +6,15 @@
 //
 // The ADK web launcher composes one or more sublaunchers, each activated by a CLI
 // keyword. This package registers the keyword "agui" and mounts AG-UI HTTP routes on
-// the shared gorilla/mux router started by google.golang.org/adk/cmd/launcher/web.
+// the process-wide host mux (go.alis.build/mux) via [HostRouteSetup]. The /run_sse
+// and /threads endpoints require IAM authentication; /capabilities is public.
 //
 // # Agent binding
 //
 // NewLauncher requires an app name string used as the ADK runner AppName and to
 // distinguish the root agent from sub-agent step events on the SSE stream.
 //
-// At setup time, SetupSubrouters creates a single [adkrun.Runtime] bound to the
+// At setup time, [SetupHostRoutes] creates a single [adkrun.Runtime] bound to the
 // configured app name. One aguiLauncher instance therefore serves exactly
 // one agent. To expose multiple agents, deploy one launcher per agent (the same
 // pattern as the A2A sublauncher) or extend routing to load agents per request.
@@ -26,8 +27,9 @@
 //
 // Routes are mounted under a configurable path prefix (default "/agui"):
 //
-//	{path_prefix}/run_sse       POST  — SSE streaming endpoint for agent runs
-//	{path_prefix}/capabilities  GET   — capability discovery (only if configured)
+//	{path_prefix}/run_sse                        POST  — SSE streaming endpoint for agent runs (authenticated)
+//	{path_prefix}/capabilities                   GET   — capability discovery (public, only if configured)
+//	{path_prefix}/threads/{threadId}/messages     GET   — thread message history (authenticated)
 //
 // When CORS is enabled via WithCORS, OPTIONS preflight is handled for the registered
 // routes in addition to POST and GET.
@@ -79,8 +81,8 @@
 //
 //	adk web --port 8080 agui -path_prefix=/api/agui
 //
-// On startup, UserMessage prints the full /run_sse URL (for example
-// http://localhost:8080/agui/run_sse).
+// On startup, UserMessage prints the registered endpoint URLs (for example
+// http://localhost:8080/agui/run_sse and the thread messages path).
 //
 // # Call interceptors
 //
@@ -90,8 +92,9 @@
 //   - OnEmit — observe or modify each AG-UI event before it is written to the wire.
 //   - After — cleanup; runs in reverse order for interceptors whose Before succeeded.
 //
-// Interceptors should populate [CallContext.User] in Before; the handler requires a
-// non-empty user name (defaults to "agui-user" if none is set). Embed
+// The handler populates [CallContext.User] from the mux IAM identity before
+// interceptors run. Interceptors may override [CallContext.User] if needed.
+// The handler requires a non-empty user name after interceptors complete. Embed
 // [PassthroughInterceptor] to implement only the hooks you need.
 //
 // # Event mapping and part conversion
@@ -114,6 +117,21 @@
 // [WithConvertAfter] and [WithConvertLimit]. This function does not require the
 // sublauncher to be running; use it from custom HTTP handlers or tooling that need
 // AG-UI-shaped history without a live SSE run.
+//
+// # Thread message history
+//
+// GET {path_prefix}/threads/{threadId}/messages loads the ADK session for the
+// authenticated user and thread ID, converts stored events to AG-UI messages via
+// [ConvertSessionToMessages], and returns them as JSON or SSE depending on the
+// Accept header.
+//
+// JSON response (default): {"messages": [...], "nextCursor": "..."}.
+// SSE response (Accept: text/event-stream): RunStarted → MessagesSnapshot →
+// StateSnapshot (if non-empty) → RunFinished.
+//
+// Query parameters "after" (RFC 3339 cursor) and "limit" support pagination.
+// The path matches CopilotKit's fetch-router expectation for
+// /threads/{id}/messages.
 //
 // # Capabilities
 //

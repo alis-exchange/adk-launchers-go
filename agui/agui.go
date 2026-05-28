@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
@@ -18,13 +19,19 @@ import (
 	"github.com/gorilla/mux"
 	"go.alis.build/adk/launchers/internal/adkrun"
 	"go.alis.build/adk/launchers/internal/launcherutils"
+	launchersweb "go.alis.build/adk/launchers/web"
+	"go.alis.build/iam/v3"
+	alismux "go.alis.build/mux"
 	"google.golang.org/adk/cmd/launcher"
 	weblauncher "google.golang.org/adk/cmd/launcher/web"
 	"google.golang.org/adk/session"
 	"google.golang.org/genai"
 )
 
-var _ weblauncher.Sublauncher = &aguiLauncher{}
+var (
+	_ launchersweb.HostRouteSetup = (*aguiLauncher)(nil)
+	_ weblauncher.Sublauncher     = &aguiLauncher{}
+)
 
 // CORSConfig controls Cross-Origin Resource Sharing headers on the AG-UI endpoint.
 // Browser-based frontends (CopilotKit, custom Vue/React apps) require CORS
@@ -61,7 +68,7 @@ type GenAIPartConverter func(ctx context.Context, adkEvent *session.Event, part 
 
 // AGUIConfig holds configuration for the AG-UI sublauncher. It is populated
 // by [NewLauncher] and functional options; fields are read when routes are
-// registered in [aguiLauncher.SetupSubrouters] and on each /run_sse request.
+// registered in [SetupHostRoutes] and on each /run_sse request.
 type AGUIConfig struct {
 	// appName is the ADK runner AppName and used to distinguish the root agent
 	// from sub-agent authors when emitting StepStarted/StepFinished events.
@@ -130,12 +137,15 @@ func WithGenAIPartConverter(converter GenAIPartConverter) Option {
 }
 
 // aguiLauncher implements [weblauncher.Sublauncher] for the AG-UI protocol.
-// A single instance serves one root agent; see SetupSubrouters for routing limits.
+// A single instance serves one root agent; see [SetupHostRoutes] for routing.
 type aguiLauncher struct {
 	flags          *flag.FlagSet
 	config         *AGUIConfig
 	runtime        *adkrun.Runtime
 	sessionService session.Service // used for pending-interrupt persistence across runs
+
+	hostSetupOnce sync.Once
+	hostSetupErr  error
 }
 
 // NewLauncher creates a new AG-UI sublauncher. Register it with [web.NewLauncher]
@@ -188,56 +198,61 @@ func (l *aguiLauncher) SimpleDescription() string {
 	return "starts AG-UI protocol server for CopilotKit and other AG-UI compatible clients"
 }
 
-// SetupSubrouters registers the AG-UI endpoints on the router:
-//   - POST /run_sse — SSE streaming endpoint for agent runs
-//   - GET /capabilities — capability discovery endpoint (if configured)
+// SetupSubrouters is a no-op; all routes are registered on the host mux via
+// [SetupHostRoutes]. The gorilla subrouter is not used.
+func (l *aguiLauncher) SetupSubrouters(_ *mux.Router, _ *launcher.Config) error {
+	return nil
+}
+
+// SetupHostRoutes registers all AG-UI routes on the process-wide host mux
+// (go.alis.build/mux). It creates the ADK runtime and session service used
+// by both /run_sse and thread message history.
 //
-// When CORS is configured, OPTIONS preflight is also handled for both routes.
-func (l *aguiLauncher) SetupSubrouters(router *mux.Router, config *launcher.Config) error {
-	// TODO: Support multi-tenant / multi-agent routing.
-	// The runtime is currently created once at setup for the single root agent,
-	// which means one aguiLauncher instance serves exactly one agent. To support
-	// multi-agent routing (e.g. /agui/{app_name}/run_sse), this would need to:
-	//   1. Register path-based routes with an {app_name} variable.
-	//   2. Extract app_name from the request in runSSEHandler.
-	//   3. Call config.AgentLoader.LoadAgent(appName) per request to resolve
-	//      the target agent dynamically.
-	//   4. Create the runtime per request (as adkrun.Runtime does internally).
-	// Until then, deploy one aguiLauncher per agent, matching the A2A launcher
-	// pattern which also binds to a single RootAgent at setup time.
+// Routes registered:
+//
+//	POST {pathPrefix}/run_sse                        — SSE streaming endpoint (authenticated)
+//	GET  {pathPrefix}/threads/{threadId}/messages     — thread message history (authenticated)
+//	GET  {pathPrefix}/capabilities                    — capability discovery (public, if configured)
+//	OPTIONS for each route above                      — CORS preflight (when WithCORS is set)
+func (l *aguiLauncher) SetupHostRoutes(config *launcher.Config) error {
+	l.hostSetupOnce.Do(func() {
+		l.hostSetupErr = l.mountHostRoutes(config)
+	})
+	return l.hostSetupErr
+}
+
+func (l *aguiLauncher) mountHostRoutes(config *launcher.Config) error {
 	rt, err := adkrun.NewRuntime(config, l.config.appName)
 	if err != nil {
 		return fmt.Errorf("failed to create ADK runtime: %w", err)
 	}
 	l.runtime = rt
-	// Session service backs pending-interrupt tracking (AG-UI resume contract).
 	l.sessionService = config.SessionService
 
-	h := l.runSSEHandler()
+	// POST /run_sse — SSE streaming endpoint for agent runs.
+	ssePath := l.config.pathPrefix + "/run_sse"
+	sseHandler := l.wrapCORS(ssePath, l.runSSEHandler())
+	alismux.AuthenticatedHandleHTTP("POST "+ssePath, sseHandler)
 
-	if l.config.cors != nil {
-		h = l.corsMiddleware(h)
-		router.Handle(l.config.pathPrefix+"/run_sse", h).Methods(http.MethodPost, http.MethodOptions)
-	} else {
-		router.Handle(l.config.pathPrefix+"/run_sse", h).Methods(http.MethodPost)
-	}
+	// GET /threads/{threadId}/messages — thread message history.
+	threadsPath := l.config.pathPrefix + "/threads/{threadId}/messages"
+	threadsHandler := l.wrapCORS(threadsPath, l.threadMessagesHandler())
+	alismux.AuthenticatedHandleHTTP("GET "+threadsPath, threadsHandler)
 
+	// GET /capabilities — capability discovery (optional).
 	if l.config.capabilities != nil {
-		capsHandler := l.capabilitiesHandler()
-		if l.config.cors != nil {
-			capsHandler = l.corsMiddleware(capsHandler)
-			router.Handle(l.config.pathPrefix+"/capabilities", capsHandler).Methods(http.MethodGet, http.MethodOptions)
-		} else {
-			router.Handle(l.config.pathPrefix+"/capabilities", capsHandler).Methods(http.MethodGet)
-		}
+		capsPath := l.config.pathPrefix + "/capabilities"
+		capsHandler := l.wrapCORS(capsPath, l.capabilitiesHandler())
+		alismux.HandleHTTP("GET "+capsPath, capsHandler)
 	}
 
 	return nil
 }
 
-// UserMessage prints the AG-UI endpoint URL to the console on startup.
+// UserMessage prints the AG-UI endpoint URLs to the console on startup.
 func (l *aguiLauncher) UserMessage(webURL string, printer func(v ...any)) {
 	printer(fmt.Sprintf("       agui:  AG-UI SSE endpoint is available at %s%s/run_sse", webURL, l.config.pathPrefix))
+	printer(fmt.Sprintf("       agui:  thread messages at %s%s/threads/{threadId}/messages", webURL, l.config.pathPrefix))
 }
 
 // capabilitiesHandler returns an HTTP handler that serves the agent's
@@ -462,10 +477,12 @@ func (l *aguiLauncher) runSSEHandler() http.Handler {
 		sessionID := state.threadID
 
 		ctx := r.Context()
-		callCtx := &CallContext{
-			User: &User{
-				Name: "agui-user",
-			},
+
+		// Populate user from mux IAM identity. Interceptors may override.
+		callCtx := &CallContext{User: &User{}}
+		if identity, identityErr := iam.FromContext(ctx); identityErr == nil && identity != nil {
+			callCtx.User.Name = identity.ID
+			callCtx.User.Authenticated = true
 		}
 
 		// Run Before interceptors, tracking how many succeeded so After

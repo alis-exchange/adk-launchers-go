@@ -40,31 +40,27 @@ func testRuntime(t *testing.T) *Runtime {
 func TestNewRuntime_validation(t *testing.T) {
 	t.Parallel()
 
-	_, err := NewRuntime(nil, "app")
-	if err == nil {
-		t.Fatal("expected error for nil config")
-	}
-
-	_, err = NewRuntime(&launcher.Config{}, "")
-	if err == nil {
-		t.Fatal("expected error for empty app name")
-	}
-
-	_, err = NewRuntime(&launcher.Config{AgentLoader: nil, SessionService: nil}, "app")
-	if err == nil {
-		t.Fatal("expected error for nil AgentLoader")
-	}
-
-	// Dedicated test: AgentLoader provided, SessionService nil.
 	a, _ := agent.New(agent.Config{Name: "a", Run: func(agent.InvocationContext) iter.Seq2[*session.Event, error] {
 		return func(yield func(*session.Event, error) bool) {}
 	}})
-	_, err = NewRuntime(&launcher.Config{
-		AgentLoader:    agent.NewSingleLoader(a),
-		SessionService: nil,
-	}, "app")
-	if err == nil {
-		t.Fatal("expected error for nil SessionService")
+
+	tests := []struct {
+		name   string
+		config *launcher.Config
+		app    string
+	}{
+		{"nil config", nil, "app"},
+		{"empty app name", &launcher.Config{}, ""},
+		{"nil AgentLoader", &launcher.Config{AgentLoader: nil, SessionService: nil}, "app"},
+		{"nil SessionService", &launcher.Config{AgentLoader: agent.NewSingleLoader(a), SessionService: nil}, "app"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewRuntime(tt.config, tt.app)
+			if err == nil {
+				t.Fatalf("NewRuntime() expected error for %s", tt.name)
+			}
+		})
 	}
 }
 
@@ -262,14 +258,13 @@ func TestRunUserMessage_happyPath(t *testing.T) {
 func TestRunUserMessage_emptyPrompt(t *testing.T) {
 	rt := testRuntime(t)
 
-	_, err := rt.RunUserMessage(t.Context(), "user-1", "", "")
-	if err == nil {
-		t.Fatal("expected error for empty prompt")
-	}
-
-	_, err = rt.RunUserMessage(t.Context(), "user-1", "", "   ")
-	if err == nil {
-		t.Fatal("expected error for whitespace-only prompt")
+	for _, prompt := range []string{"", "   "} {
+		t.Run(fmt.Sprintf("prompt=%q", prompt), func(t *testing.T) {
+			_, err := rt.RunUserMessage(t.Context(), "user-1", "", prompt)
+			if err == nil {
+				t.Fatalf("expected error for prompt %q", prompt)
+			}
+		})
 	}
 }
 

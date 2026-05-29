@@ -1,8 +1,11 @@
 package agui
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -11,38 +14,44 @@ import (
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/encoding/sse"
+	pb "go.alis.build/common/alis/agui/history/v1"
+	historyservice "go.alis.build/agui/history/service"
 	"go.alis.build/iam/v3"
 	alismux "go.alis.build/mux"
 	"google.golang.org/adk/session"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	grpcstatus "google.golang.org/grpc/status"
 )
 
-// threadMessagesHandler returns a handler that loads an ADK session and returns
+// threadMessagesFunc returns a handler that loads an ADK session and returns
 // its conversation history as AG-UI messages. The response format is determined
 // by the Accept header: SSE wraps messages in a run lifecycle; JSON returns a
 // messages array with optional pagination cursor.
 //
 // Identity is extracted from the request context via [iam.FromContext]; the
 // caller (SetupHostRoutes) is responsible for running authentication middleware.
-func (l *aguiLauncher) threadMessagesHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+func (l *aguiLauncher) threadMessagesFunc() alismux.Func {
+	return func(w http.ResponseWriter, r *http.Request) error {
 		ctx := r.Context()
 
 		identity, identityErr := iam.FromContext(ctx)
 		if identityErr != nil || identity == nil {
 			http.Error(w, "authentication required", http.StatusUnauthorized)
-			return
+			return nil
 		}
 		userID := identity.ID
 
 		if l.sessionService == nil {
 			http.Error(w, "session service not configured", http.StatusServiceUnavailable)
-			return
+			return nil
 		}
 
 		threadID := r.PathValue("threadId")
 		if threadID == "" {
 			http.Error(w, "missing thread ID", http.StatusBadRequest)
-			return
+			return nil
 		}
 
 		var afterTime time.Time
@@ -50,7 +59,7 @@ func (l *aguiLauncher) threadMessagesHandler() http.HandlerFunc {
 			parsed, parseErr := time.Parse(time.RFC3339Nano, afterStr)
 			if parseErr != nil {
 				http.Error(w, "invalid 'after' parameter: expected RFC 3339 timestamp", http.StatusBadRequest)
-				return
+				return nil
 			}
 			afterTime = parsed
 		}
@@ -60,7 +69,7 @@ func (l *aguiLauncher) threadMessagesHandler() http.HandlerFunc {
 			n, parseErr := strconv.Atoi(limitStr)
 			if parseErr != nil || n < 0 {
 				http.Error(w, "invalid 'limit' parameter: expected non-negative integer", http.StatusBadRequest)
-				return
+				return nil
 			}
 			limit = n
 		}
@@ -77,7 +86,7 @@ func (l *aguiLauncher) threadMessagesHandler() http.HandlerFunc {
 		if getErr != nil {
 			log.Printf("agui: thread messages: session.Get failed for %s: %v", threadID, getErr)
 			http.Error(w, "session not found", http.StatusNotFound)
-			return
+			return nil
 		}
 
 		var opts []ConvertOption
@@ -95,7 +104,7 @@ func (l *aguiLauncher) threadMessagesHandler() http.HandlerFunc {
 		if convertErr != nil {
 			log.Printf("agui: thread messages: convert failed for %s: %v", threadID, convertErr)
 			http.Error(w, "failed to convert session events", http.StatusInternalServerError)
-			return
+			return nil
 		}
 
 		if acceptsSSE(r) {
@@ -103,6 +112,7 @@ func (l *aguiLauncher) threadMessagesHandler() http.HandlerFunc {
 		} else {
 			serveThreadMessagesJSON(w, getResp.Session, messages, limit)
 		}
+		return nil
 	}
 }
 
@@ -168,19 +178,12 @@ func acceptsSSE(r *http.Request) bool {
 	return false
 }
 
-// wrapCORS wraps handler with CORS middleware and registers an OPTIONS preflight
-// handler for the given path when CORS is configured. Returns the handler unchanged
-// when CORS is not enabled.
-func (l *aguiLauncher) wrapCORS(path string, handler http.Handler) http.Handler {
+// registerCORSPreflight registers an OPTIONS preflight handler for path with
+// the given allowed methods. No-op when CORS is not configured.
+func (l *aguiLauncher) registerCORSPreflight(path string, methods string) {
 	if l.config.cors == nil {
-		return handler
+		return
 	}
-	alismux.HandleHTTP("OPTIONS "+path, l.corsOptionsHandler())
-	return l.corsMiddleware(handler)
-}
-
-// corsOptionsHandler returns a handler for CORS preflight requests.
-func (l *aguiLauncher) corsOptionsHandler() http.Handler {
 	corsCfg := l.config.cors
 
 	allowedHeaders := "Content-Type, Authorization"
@@ -188,29 +191,204 @@ func (l *aguiLauncher) corsOptionsHandler() http.Handler {
 		allowedHeaders = strings.Join(corsCfg.AllowedHeaders, ", ")
 	}
 
-	isAllowedOrigin := func(origin string) bool {
-		for _, allowed := range corsCfg.AllowedOrigins {
-			if allowed == "*" || allowed == origin {
-				return true
-			}
-		}
-		return false
-	}
+	allowMethods := methods + ", OPTIONS"
 
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
-		if origin != "" && isAllowedOrigin(origin) {
-			if corsCfg.AllowCredentials {
-				w.Header().Set("Access-Control-Allow-Origin", origin)
-				w.Header().Set("Access-Control-Allow-Credentials", "true")
-			} else if len(corsCfg.AllowedOrigins) == 1 && corsCfg.AllowedOrigins[0] == "*" {
-				w.Header().Set("Access-Control-Allow-Origin", "*")
-			} else {
-				w.Header().Set("Access-Control-Allow-Origin", origin)
-			}
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	alismux.Options(path, func(w http.ResponseWriter, r *http.Request) error {
+		if l.setCORSOriginHeaders(w, r) {
+			w.Header().Set("Access-Control-Allow-Methods", allowMethods)
 			w.Header().Set("Access-Control-Allow-Headers", allowedHeaders)
 		}
 		w.WriteHeader(http.StatusNoContent)
+		return nil
 	})
+}
+
+// getThreadFunc returns a [alismux.Func] that fetches a single thread's metadata
+// from the configured ThreadService.
+func (l *aguiLauncher) getThreadFunc() alismux.Func {
+	return func(w http.ResponseWriter, r *http.Request) error {
+		ctx := r.Context()
+
+		identity, identityErr := iam.FromContext(ctx)
+		if identityErr != nil || identity == nil {
+			http.Error(w, "authentication required", http.StatusUnauthorized)
+			return nil
+		}
+
+		threadID := r.PathValue("threadId")
+		if threadID == "" {
+			http.Error(w, "missing thread ID", http.StatusBadRequest)
+			return nil
+		}
+
+		svcCtx := injectGrpcMetadata(ctx, identity, pb.ThreadService_GetThread_FullMethodName)
+		thread, getErr := l.config.threadService.GetThread(svcCtx, &pb.GetThreadRequest{
+			Name: "threads/" + threadID,
+		})
+		if getErr != nil {
+			log.Printf("agui: get thread failed for %s: %v", threadID, getErr)
+			grpcToHTTP(w, getErr, "failed to get thread", http.StatusInternalServerError)
+			return nil
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(thread); err != nil {
+			log.Printf("agui: get thread: failed to encode response: %v", err)
+		}
+		return nil
+	}
+}
+
+// deleteThreadFunc returns a [alismux.Func] that deletes a thread via the configured
+// ThreadService. Requires roles/thread.owner on the thread's IAM policy.
+func (l *aguiLauncher) deleteThreadFunc() alismux.Func {
+	return func(w http.ResponseWriter, r *http.Request) error {
+		ctx := r.Context()
+
+		identity, identityErr := iam.FromContext(ctx)
+		if identityErr != nil || identity == nil {
+			http.Error(w, "authentication required", http.StatusUnauthorized)
+			return nil
+		}
+
+		threadID := r.PathValue("threadId")
+		if threadID == "" {
+			http.Error(w, "missing thread ID", http.StatusBadRequest)
+			return nil
+		}
+
+		svcCtx := injectGrpcMetadata(ctx, identity, pb.ThreadService_DeleteThread_FullMethodName)
+		if _, deleteErr := l.config.threadService.DeleteThread(svcCtx, &pb.DeleteThreadRequest{
+			Name: "threads/" + threadID,
+		}); deleteErr != nil {
+			log.Printf("agui: delete thread failed for %s: %v", threadID, deleteErr)
+			grpcToHTTP(w, deleteErr, "failed to delete thread", http.StatusInternalServerError)
+			return nil
+		}
+
+		w.WriteHeader(http.StatusNoContent)
+		return nil
+	}
+}
+
+// listThreadsFunc returns a [alismux.Func] that lists threads with per-user metadata
+// (unread, pinned) from the configured ThreadService.
+func (l *aguiLauncher) listThreadsFunc() alismux.Func {
+	return func(w http.ResponseWriter, r *http.Request) error {
+		ctx := r.Context()
+
+		identity, identityErr := iam.FromContext(ctx)
+		if identityErr != nil || identity == nil {
+			http.Error(w, "authentication required", http.StatusUnauthorized)
+			return nil
+		}
+
+		agentID := r.URL.Query().Get("agentId")
+		var pageSize int32 = 100
+		if ps := r.URL.Query().Get("pageSize"); ps != "" {
+			n, parseErr := strconv.Atoi(ps)
+			if parseErr != nil || n < 0 || n > math.MaxInt32 {
+				http.Error(w, "invalid 'pageSize' parameter", http.StatusBadRequest)
+				return nil
+			}
+			pageSize = int32(n)
+		}
+		pageToken := r.URL.Query().Get("pageToken")
+
+		svcCtx := injectGrpcMetadata(ctx, identity, pb.ThreadService_ListThreads_FullMethodName)
+		resp, listErr := l.config.threadService.ListThreads(svcCtx, &pb.ListThreadsRequest{
+			AgentId:   agentID,
+			PageSize:  pageSize,
+			PageToken: pageToken,
+		})
+		if listErr != nil {
+			log.Printf("agui: list threads failed: %v", listErr)
+			grpcToHTTP(w, listErr, "failed to list threads", http.StatusInternalServerError)
+			return nil
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			log.Printf("agui: list threads: failed to encode response: %v", err)
+		}
+		return nil
+	}
+}
+
+// upsertThreadMetadata creates or updates thread metadata via the ThreadService.
+// Best-effort: failures are logged, not returned as errors.
+func (l *aguiLauncher) upsertThreadMetadata(ctx context.Context, identity *iam.Identity, threadID string, req *types.RunAgentInput) {
+	var userText string
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		if req.Messages[i].Role != types.RoleUser {
+			continue
+		}
+		if s, ok := req.Messages[i].ContentString(); ok && s != "" {
+			userText = s
+			break
+		}
+	}
+
+	// GetThread_FullMethodName is used because CreateOrUpdateThread is not a
+	// proto-defined RPC and has no dedicated constant. The method name is only
+	// used for identity extraction, not authorization.
+	svcCtx := injectGrpcMetadata(ctx, identity, pb.ThreadService_GetThread_FullMethodName)
+	if err := l.config.threadService.CreateOrUpdateThread(svcCtx, &historyservice.CreateOrUpdateThreadRequest{
+		ThreadID:         threadID,
+		AgentID:          l.config.appName,
+		AgentDisplayName: l.config.appName,
+		UserMessageText:  userText,
+	}); err != nil {
+		log.Printf("agui: thread metadata upsert failed for %s: %v", threadID, err)
+	}
+}
+
+// injectGrpcMetadata creates a context with gRPC incoming metadata so the
+// ThreadService's IAM authorizer can find the caller identity. Required
+// because in-process calls bypass the gRPC transport layer.
+func injectGrpcMetadata(ctx context.Context, identity *iam.Identity, method string) context.Context {
+	if identity == nil {
+		return ctx
+	}
+	md := metadata.MD{
+		"x-alis-identity": {string(identity.Marshal())},
+	}
+	ctx = grpc.NewContextWithServerTransportStream(ctx, &grpcMethodStream{
+		method: fmt.Sprintf("/%s/%s", pb.ThreadService_ServiceDesc.ServiceName, extractMethodName(method)),
+	})
+	return metadata.NewIncomingContext(ctx, md)
+}
+
+func extractMethodName(fullMethod string) string {
+	parts := strings.Split(fullMethod, "/")
+	return parts[len(parts)-1]
+}
+
+type grpcMethodStream struct {
+	method string
+}
+
+func (s *grpcMethodStream) Method() string                 { return s.method }
+func (s *grpcMethodStream) SetHeader(_ metadata.MD) error  { return nil }
+func (s *grpcMethodStream) SendHeader(_ metadata.MD) error { return nil }
+func (s *grpcMethodStream) SetTrailer(_ metadata.MD) error { return nil }
+
+func grpcToHTTP(w http.ResponseWriter, err error, fallbackMsg string, fallbackCode int) {
+	st, ok := grpcstatus.FromError(err)
+	if !ok {
+		http.Error(w, fallbackMsg, fallbackCode)
+		return
+	}
+	switch st.Code() {
+	case codes.NotFound:
+		http.Error(w, st.Message(), http.StatusNotFound)
+	case codes.PermissionDenied:
+		http.Error(w, st.Message(), http.StatusForbidden)
+	case codes.InvalidArgument:
+		http.Error(w, st.Message(), http.StatusBadRequest)
+	case codes.Unauthenticated:
+		http.Error(w, st.Message(), http.StatusUnauthorized)
+	default:
+		http.Error(w, fallbackMsg, fallbackCode)
+	}
 }

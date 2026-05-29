@@ -175,7 +175,7 @@ func (l *aguiLauncher) clearPendingInterrupts(ctx context.Context, userID, sessi
 //   - expired interrupts are rejected,
 //   - resolved payloads are checked against the stored responseSchema.
 //
-// Validation errors are returned to the caller; runSSEHandler emits them as
+// Validation errors are returned to the caller; runSSEFunc emits them as
 // RunError after RunStarted so clients receive protocol-level errors on SSE.
 func validateResumeAgainstPending(entries []types.ResumeEntry, pending []pendingInterruptRecord, now time.Time) error {
 	pendingByID := make(map[string]pendingInterruptRecord, len(pending))

@@ -30,6 +30,9 @@
 //	{path_prefix}/run_sse                        POST  — SSE streaming endpoint for agent runs (authenticated)
 //	{path_prefix}/capabilities                   GET   — capability discovery (public, only if configured)
 //	{path_prefix}/threads/{threadId}/messages     GET   — thread message history (authenticated)
+//	{path_prefix}/threads/{threadId}             GET    — single thread metadata (authenticated, WithThreadService)
+//	{path_prefix}/threads/{threadId}             DELETE — delete a thread (authenticated, WithThreadService)
+//	{path_prefix}/threads                        GET    — thread listing with metadata (authenticated, WithThreadService)
 //
 // When CORS is enabled via WithCORS, OPTIONS preflight is handled for the registered
 // routes in addition to POST and GET.
@@ -51,6 +54,7 @@
 //   - WithCORS — enable CORS middleware for browser-based frontends.
 //   - WithCapabilities — expose GET /capabilities for client discovery (see below).
 //   - WithGenAIPartConverter — customize how [genai.Part] values map to AG-UI events.
+//   - WithThreadService — enable thread metadata tracking and GET /threads listing.
 //
 // CLI flags (after the "agui" keyword on the web command line):
 //
@@ -132,6 +136,23 @@
 // Query parameters "after" (RFC 3339 cursor) and "limit" support pagination.
 // The path matches CopilotKit's fetch-router expectation for
 // /threads/{id}/messages.
+//
+// # Single thread
+//
+// When [WithThreadService] is configured, GET {path_prefix}/threads/{threadId}
+// returns the metadata for a single thread (display name, run count, agent ID,
+// timestamps) from the [go.alis.build/agui/history/service.ThreadService].
+// DELETE {path_prefix}/threads/{threadId} removes the thread and its associated
+// user states. Both operations require appropriate IAM roles on the thread's policy.
+//
+// # Thread listing
+//
+// When [WithThreadService] is configured, GET {path_prefix}/threads returns a
+// list of threads with rich metadata (display names, unread tracking, pinned
+// state) from the [go.alis.build/agui/history/service.ThreadService]. Each
+// /run_sse request automatically creates or updates thread metadata (run count,
+// last activity time, display name on first run). Query parameters: "agentId"
+// (optional filter), "pageSize", "pageToken".
 //
 // # Capabilities
 //

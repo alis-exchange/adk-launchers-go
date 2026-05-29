@@ -175,7 +175,7 @@ func TestConvertMultimodalInput(t *testing.T) {
 	})
 }
 
-func TestCORSMiddleware_Preflight(t *testing.T) {
+func TestCORSMiddleware_DoesNotInterceptOPTIONS(t *testing.T) {
 	l := &aguiLauncher{
 		config: &AGUIConfig{
 			cors: &CORSConfig{
@@ -184,26 +184,70 @@ func TestCORSMiddleware_Preflight(t *testing.T) {
 		},
 	}
 
-	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Error("inner handler should not be called for preflight")
-	})
+	innerCalled := false
+	inner := func(w http.ResponseWriter, r *http.Request) error {
+		innerCalled = true
+		w.WriteHeader(http.StatusOK)
+		return nil
+	}
 
-	handler := l.corsMiddleware(inner)
+	mws := l.buildCORSMiddleware()
+	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodOptions, "/run_sse", nil)
 	req.Header.Set("Origin", "https://app.example.com")
-	rec := httptest.NewRecorder()
+	_ = mws[0](rec, req, inner)
 
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusNoContent {
-		t.Errorf("status = %d, want 204", rec.Code)
+	if !innerCalled {
+		t.Error("middleware should pass OPTIONS through to inner handler")
 	}
 	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example.com" {
 		t.Errorf("Allow-Origin = %v, want https://app.example.com", got)
 	}
-	if got := rec.Header().Get("Access-Control-Allow-Methods"); got != "POST, OPTIONS" {
-		t.Errorf("Allow-Methods = %v, want 'POST, OPTIONS'", got)
+}
+
+func TestSetCORSOriginHeaders(t *testing.T) {
+	l := &aguiLauncher{
+		config: &AGUIConfig{
+			cors: &CORSConfig{
+				AllowedOrigins: []string{"https://app.example.com"},
+			},
+		},
 	}
+
+	t.Run("allowed origin", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodOptions, "/", nil)
+		req.Header.Set("Origin", "https://app.example.com")
+
+		if !l.setCORSOriginHeaders(rec, req) {
+			t.Error("expected true for allowed origin")
+		}
+		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example.com" {
+			t.Errorf("Allow-Origin = %v, want https://app.example.com", got)
+		}
+	})
+
+	t.Run("disallowed origin", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodOptions, "/", nil)
+		req.Header.Set("Origin", "https://evil.com")
+
+		if l.setCORSOriginHeaders(rec, req) {
+			t.Error("expected false for disallowed origin")
+		}
+		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
+			t.Errorf("Allow-Origin should be empty for disallowed origin, got %v", got)
+		}
+	})
+
+	t.Run("no origin header", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+
+		if l.setCORSOriginHeaders(rec, req) {
+			t.Error("expected false when no Origin header")
+		}
+	})
 }
 
 func TestCORSMiddleware_Credentials(t *testing.T) {
@@ -216,16 +260,17 @@ func TestCORSMiddleware_Credentials(t *testing.T) {
 		},
 	}
 
-	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	inner := func(w http.ResponseWriter, r *http.Request) error {
 		w.WriteHeader(http.StatusOK)
-	})
+		return nil
+	}
 
-	handler := l.corsMiddleware(inner)
+	mws := l.buildCORSMiddleware()
 	req := httptest.NewRequest(http.MethodPost, "/run_sse", nil)
 	req.Header.Set("Origin", "https://some-origin.com")
 	rec := httptest.NewRecorder()
 
-	handler.ServeHTTP(rec, req)
+	_ = mws[0](rec, req, inner)
 
 	// With credentials, should echo exact origin, not "*".
 	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "https://some-origin.com" {
@@ -245,16 +290,17 @@ func TestCORSMiddleware_WildcardWithoutCredentials(t *testing.T) {
 		},
 	}
 
-	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	inner := func(w http.ResponseWriter, r *http.Request) error {
 		w.WriteHeader(http.StatusOK)
-	})
+		return nil
+	}
 
-	handler := l.corsMiddleware(inner)
+	mws := l.buildCORSMiddleware()
 	req := httptest.NewRequest(http.MethodPost, "/run_sse", nil)
 	req.Header.Set("Origin", "https://any.com")
 	rec := httptest.NewRecorder()
 
-	handler.ServeHTTP(rec, req)
+	_ = mws[0](rec, req, inner)
 
 	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
 		t.Errorf("Allow-Origin = %v, want * (wildcard without credentials)", got)
@@ -270,20 +316,21 @@ func TestCORSMiddleware_DisallowedOrigin(t *testing.T) {
 		},
 	}
 
-	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	inner := func(w http.ResponseWriter, r *http.Request) error {
 		w.WriteHeader(http.StatusOK)
-	})
+		return nil
+	}
 
-	handler := l.corsMiddleware(inner)
-	req := httptest.NewRequest(http.MethodOptions, "/run_sse", nil)
+	mws := l.buildCORSMiddleware()
+	req := httptest.NewRequest(http.MethodGet, "/run_sse", nil)
 	req.Header.Set("Origin", "https://evil.com")
 	rec := httptest.NewRecorder()
 
-	handler.ServeHTTP(rec, req)
+	_ = mws[0](rec, req, inner)
 
-	// Should still return 204 but without CORS headers.
-	if rec.Code != http.StatusNoContent {
-		t.Errorf("status = %d, want 204", rec.Code)
+	// Inner handler should still run; CORS headers should be absent.
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", rec.Code)
 	}
 	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
 		t.Errorf("Allow-Origin should be empty for disallowed origin, got %v", got)
@@ -300,16 +347,17 @@ func TestCORSMiddleware_ExposeHeaders(t *testing.T) {
 		},
 	}
 
-	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	inner := func(w http.ResponseWriter, r *http.Request) error {
 		w.WriteHeader(http.StatusOK)
-	})
+		return nil
+	}
 
-	handler := l.corsMiddleware(inner)
+	mws := l.buildCORSMiddleware()
 	req := httptest.NewRequest(http.MethodPost, "/run_sse", nil)
 	req.Header.Set("Origin", "https://app.com")
 	rec := httptest.NewRecorder()
 
-	handler.ServeHTTP(rec, req)
+	_ = mws[0](rec, req, inner)
 
 	if got := rec.Header().Get("Access-Control-Expose-Headers"); got != "X-Request-Id, X-Trace-Id" {
 		t.Errorf("Expose-Headers = %v, want 'X-Request-Id, X-Trace-Id'", got)
@@ -329,11 +377,11 @@ func TestCapabilitiesHandler(t *testing.T) {
 		},
 	}
 
-	handler := l.capabilitiesHandler()
+	handler := l.capabilitiesFunc()
 	req := httptest.NewRequest(http.MethodGet, "/capabilities", nil)
 	rec := httptest.NewRecorder()
 
-	handler.ServeHTTP(rec, req)
+	_ = handler(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Errorf("status = %d, want 200", rec.Code)

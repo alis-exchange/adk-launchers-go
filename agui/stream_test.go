@@ -815,7 +815,7 @@ func TestInterrupt_PersistFailure_NoDoubleTerminal(t *testing.T) {
 		t.Fatal("expected runFinalized=true after interrupt")
 	}
 
-	// Simulate what runSSEHandler does after the event loop: persist fails.
+	// Simulate what runSSEFunc does after the event loop: persist fails.
 	persistErr := l.persistPendingInterrupts(ctx, "user-1", "t1", state.emittedInterrupts)
 	if persistErr == nil {
 		t.Fatal("expected persist to fail with failAppendService")

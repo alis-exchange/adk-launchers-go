@@ -46,7 +46,7 @@ func createSessionWithEvents(t *testing.T, ctx context.Context, svc session.Serv
 }
 
 func callThreadHandler(l *aguiLauncher, identity *iam.Identity, threadID string, query string, accept string) *httptest.ResponseRecorder {
-	handler := l.threadMessagesHandler()
+	handler := l.threadMessagesFunc()
 
 	path := "/agui/threads/" + threadID + "/messages"
 	if query != "" {
@@ -65,7 +65,7 @@ func callThreadHandler(l *aguiLauncher, identity *iam.Identity, threadID string,
 	req = req.WithContext(ctx)
 
 	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
+	_ = handler(rec, req)
 	return rec
 }
 

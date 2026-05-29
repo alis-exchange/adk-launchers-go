@@ -41,7 +41,7 @@ type emitter struct {
 }
 
 // newEmitter constructs an SSE emitter for one /run_sse request. Interceptors
-// are limited to those whose Before hook succeeded (see runSSEHandler).
+// are limited to those whose Before hook succeeded (see runSSEFunc).
 func newEmitter(ctx context.Context, w http.ResponseWriter, writer *sse.SSEWriter, interceptors []CallInterceptor, callCtx *CallContext) *emitter {
 	return &emitter{ctx: ctx, w: w, writer: writer, interceptors: interceptors, callCtx: callCtx}
 }
@@ -82,6 +82,7 @@ type streamState struct {
 	currentReasoningMessageID string            // active reasoning message within the phase, empty when none open
 	lastTextMessageID         string            // most recent closed text message, used as parentMessageID for tool calls
 	currentStepAuthor         string            // active sub-agent step, empty when at root agent
+	emittedReasoningLen       int               // bytes of reasoning already emitted; used to compute deltas from accumulated partials
 	runFinalized              bool              // true once RunFinished or RunError has been emitted
 	emittedInterrupts         []types.Interrupt // interrupts emitted this run; persisted to session state
 }
@@ -140,7 +141,21 @@ func (l *aguiLauncher) processEvent(e *emitter, ev *session.Event, state *stream
 			// ReasoningStart/End bracket the phase; ReasoningMessageStart/Content/End
 			// bracket individual messages within it. Per the AG-UI spec, these use
 			// separate IDs.
+			//
+			// ADK partial events contain accumulated thought text, not deltas.
+			// Track how much has been emitted and only send the new portion.
+			// Skip non-partial (final) events to avoid re-emitting the full text.
 			if part.Thought && part.Text != "" {
+				if !ev.Partial {
+					continue
+				}
+
+				if len(part.Text) <= state.emittedReasoningLen {
+					continue
+				}
+				delta := part.Text[state.emittedReasoningLen:]
+				state.emittedReasoningLen = len(part.Text)
+
 				closeTextMessage(e, state)
 
 				if state.currentReasoningPhaseID == "" {
@@ -151,7 +166,7 @@ func (l *aguiLauncher) processEvent(e *emitter, ev *session.Event, state *stream
 					state.currentReasoningMessageID = events.GenerateMessageID()
 					e.emit(events.NewReasoningMessageStartEvent(state.currentReasoningMessageID, "reasoning"))
 				}
-				e.emit(events.NewReasoningMessageContentEvent(state.currentReasoningMessageID, part.Text))
+				e.emit(events.NewReasoningMessageContentEvent(state.currentReasoningMessageID, delta))
 				continue
 			}
 
@@ -296,6 +311,7 @@ func closeReasoningMessage(e *emitter, state *streamState) {
 		e.emit(events.NewReasoningEndEvent(state.currentReasoningPhaseID))
 		state.currentReasoningPhaseID = ""
 	}
+	state.emittedReasoningLen = 0
 }
 
 // emitInterrupt converts an adk_request_confirmation FunctionCall into an

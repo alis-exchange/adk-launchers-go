@@ -20,6 +20,7 @@ import (
 	"go.alis.build/adk/launchers/internal/adkrun"
 	"go.alis.build/adk/launchers/internal/launcherutils"
 	launchersweb "go.alis.build/adk/launchers/web"
+	historyservice "go.alis.build/agui/history/service"
 	"go.alis.build/iam/v3"
 	alismux "go.alis.build/mux"
 	"google.golang.org/adk/cmd/launcher"
@@ -83,6 +84,9 @@ type AGUIConfig struct {
 	capabilities *Capabilities
 	// genAIPartConverter optionally overrides mapping of genai.Part to AG-UI events.
 	genAIPartConverter GenAIPartConverter
+	// threadService, when non-nil, enables thread metadata tracking and the
+	// GET /threads listing endpoint.
+	threadService *historyservice.ThreadService
 }
 
 // Option configures an [AGUIConfig] passed to [NewLauncher].
@@ -133,6 +137,19 @@ func WithCapabilities(caps Capabilities) Option {
 func WithGenAIPartConverter(converter GenAIPartConverter) Option {
 	return func(c *AGUIConfig) {
 		c.genAIPartConverter = converter
+	}
+}
+
+// WithThreadService enables thread metadata tracking backed by the given
+// [historyservice.ThreadService]. When configured:
+//
+//   - GET {path_prefix}/threads is registered, returning thread listings with
+//     unread/pinned state for the authenticated user.
+//   - Each /run_sse request automatically creates or updates the thread's
+//     metadata (run count, last activity time, display name on first run).
+func WithThreadService(svc *historyservice.ThreadService) Option {
+	return func(c *AGUIConfig) {
+		c.threadService = svc
 	}
 }
 
@@ -229,21 +246,36 @@ func (l *aguiLauncher) mountHostRoutes(config *launcher.Config) error {
 	l.runtime = rt
 	l.sessionService = config.SessionService
 
+	// Build the CORS middleware once (nil slice when CORS is not configured).
+	corsMW := l.buildCORSMiddleware()
+
 	// POST /run_sse — SSE streaming endpoint for agent runs.
 	ssePath := l.config.pathPrefix + "/run_sse"
-	sseHandler := l.wrapCORS(ssePath, l.runSSEHandler())
-	alismux.AuthenticatedHandleHTTP("POST "+ssePath, sseHandler)
+	l.registerCORSPreflight(ssePath, "POST")
+	alismux.AuthenticatedPost(ssePath, l.runSSEFunc(), corsMW...)
 
 	// GET /threads/{threadId}/messages — thread message history.
-	threadsPath := l.config.pathPrefix + "/threads/{threadId}/messages"
-	threadsHandler := l.wrapCORS(threadsPath, l.threadMessagesHandler())
-	alismux.AuthenticatedHandleHTTP("GET "+threadsPath, threadsHandler)
+	messagesPath := l.config.pathPrefix + "/threads/{threadId}/messages"
+	l.registerCORSPreflight(messagesPath, "GET")
+	alismux.AuthenticatedGet(messagesPath, l.threadMessagesFunc(), corsMW...)
+
+	// Thread metadata endpoints (optional, requires WithThreadService).
+	if l.config.threadService != nil {
+		threadPath := l.config.pathPrefix + "/threads/{threadId}"
+		l.registerCORSPreflight(threadPath, "GET, DELETE")
+		alismux.AuthenticatedGet(threadPath, l.getThreadFunc(), corsMW...)
+		alismux.AuthenticatedDelete(threadPath, l.deleteThreadFunc(), corsMW...)
+
+		listPath := l.config.pathPrefix + "/threads"
+		l.registerCORSPreflight(listPath, "GET")
+		alismux.AuthenticatedGet(listPath, l.listThreadsFunc(), corsMW...)
+	}
 
 	// GET /capabilities — capability discovery (optional).
 	if l.config.capabilities != nil {
 		capsPath := l.config.pathPrefix + "/capabilities"
-		capsHandler := l.wrapCORS(capsPath, l.capabilitiesHandler())
-		alismux.HandleHTTP("GET "+capsPath, capsHandler)
+		l.registerCORSPreflight(capsPath, "GET")
+		alismux.Get(capsPath, l.capabilitiesFunc(), corsMW...)
 	}
 
 	return nil
@@ -253,88 +285,86 @@ func (l *aguiLauncher) mountHostRoutes(config *launcher.Config) error {
 func (l *aguiLauncher) UserMessage(webURL string, printer func(v ...any)) {
 	printer(fmt.Sprintf("       agui:  AG-UI SSE endpoint is available at %s%s/run_sse", webURL, l.config.pathPrefix))
 	printer(fmt.Sprintf("       agui:  thread messages at %s%s/threads/{threadId}/messages", webURL, l.config.pathPrefix))
+	if l.config.threadService != nil {
+		printer(fmt.Sprintf("       agui:  thread detail at %s%s/threads/{threadId}", webURL, l.config.pathPrefix))
+		printer(fmt.Sprintf("       agui:  thread listing at %s%s/threads", webURL, l.config.pathPrefix))
+	}
+	if l.config.capabilities != nil {
+		printer(fmt.Sprintf("       agui:  capabilities at %s%s/capabilities", webURL, l.config.pathPrefix))
+	}
 }
 
-// capabilitiesHandler returns an HTTP handler that serves the agent's
+// capabilitiesFunc returns a [alismux.Func] that serves the agent's
 // declared capabilities as JSON.
-func (l *aguiLauncher) capabilitiesHandler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func (l *aguiLauncher) capabilitiesFunc() alismux.Func {
+	return func(w http.ResponseWriter, r *http.Request) error {
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(l.config.capabilities); err != nil {
 			http.Error(w, "failed to encode capabilities", http.StatusInternalServerError)
 		}
-	})
+		return nil
+	}
 }
 
-// corsMiddleware wraps an HTTP handler with CORS response headers derived
-// from the launcher's CORSConfig. It short-circuits OPTIONS preflight
-// requests with 204 No Content.
+// buildCORSMiddleware returns a single [alismux.Middleware] that adds CORS
+// response headers on actual (non-preflight) requests. Returns nil when CORS
+// is not configured. OPTIONS preflight is handled by dedicated routes
+// registered via [registerCORSPreflight].
 //
 // When AllowCredentials is true, the middleware echoes the request's Origin
 // header instead of using "*", because the CORS spec forbids wildcard origins
 // with credentialed requests. When AllowCredentials is false and the only
 // configured origin is "*", it returns "*" directly.
-func (l *aguiLauncher) corsMiddleware(next http.Handler) http.Handler {
-	corsCfg := l.config.cors
-
-	allowedHeaders := "Content-Type, Authorization"
-	if len(corsCfg.AllowedHeaders) > 0 {
-		allowedHeaders = strings.Join(corsCfg.AllowedHeaders, ", ")
+func (l *aguiLauncher) buildCORSMiddleware() []alismux.Middleware {
+	if l.config.cors == nil {
+		return nil
 	}
 
 	exposeHeaders := ""
-	if len(corsCfg.ExposeHeaders) > 0 {
-		exposeHeaders = strings.Join(corsCfg.ExposeHeaders, ", ")
+	if len(l.config.cors.ExposeHeaders) > 0 {
+		exposeHeaders = strings.Join(l.config.cors.ExposeHeaders, ", ")
 	}
 
-	isAllowedOrigin := func(origin string) bool {
-		for _, allowed := range corsCfg.AllowedOrigins {
-			if allowed == "*" || allowed == origin {
-				return true
-			}
+	mw := func(w http.ResponseWriter, r *http.Request, handler alismux.Func) error {
+		if l.setCORSOriginHeaders(w, r) && exposeHeaders != "" {
+			w.Header().Set("Access-Control-Expose-Headers", exposeHeaders)
 		}
+		return handler(w, r)
+	}
+
+	return []alismux.Middleware{mw}
+}
+
+// setCORSOriginHeaders checks the request origin against the configured
+// AllowedOrigins and sets Access-Control-Allow-Origin (and Allow-Credentials
+// when applicable). Returns true if the origin was allowed.
+func (l *aguiLauncher) setCORSOriginHeaders(w http.ResponseWriter, r *http.Request) bool {
+	corsCfg := l.config.cors
+	origin := r.Header.Get("Origin")
+	if origin == "" {
 		return false
 	}
 
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
-
-		if origin != "" && isAllowedOrigin(origin) {
-			// When credentials are enabled, the spec requires the exact origin
-			// (not "*"). Otherwise, use "*" only if it's the sole allowed origin.
-			if corsCfg.AllowCredentials {
-				w.Header().Set("Access-Control-Allow-Origin", origin)
-				w.Header().Set("Access-Control-Allow-Credentials", "true")
-			} else if len(corsCfg.AllowedOrigins) == 1 && corsCfg.AllowedOrigins[0] == "*" {
-				w.Header().Set("Access-Control-Allow-Origin", "*")
-			} else {
-				w.Header().Set("Access-Control-Allow-Origin", origin)
-			}
-
-			// Preflight: return allowed methods/headers and stop.
-			if r.Method == http.MethodOptions {
-				w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-				w.Header().Set("Access-Control-Allow-Headers", allowedHeaders)
-				w.WriteHeader(http.StatusNoContent)
-				return
-			}
-
-			// Actual request: expose any configured response headers.
-			if exposeHeaders != "" {
-				w.Header().Set("Access-Control-Expose-Headers", exposeHeaders)
-			}
+	allowed := false
+	for _, a := range corsCfg.AllowedOrigins {
+		if a == "*" || a == origin {
+			allowed = true
+			break
 		}
+	}
+	if !allowed {
+		return false
+	}
 
-		// Preflight from a disallowed origin: still return 204 so the
-		// browser gets a clean response; it will block because the
-		// CORS headers are absent.
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	})
+	if corsCfg.AllowCredentials {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+	} else if len(corsCfg.AllowedOrigins) == 1 && corsCfg.AllowedOrigins[0] == "*" {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+	} else {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+	}
+	return true
 }
 
 // convertMultimodalInput converts a typed AG-UI InputContent (image, audio,
@@ -442,22 +472,22 @@ func extractLastUserMessage(messages []types.Message) (*genai.Content, error) {
 	return nil, fmt.Errorf("no user message found in payload")
 }
 
-// runSSEHandler returns the HTTP handler for the AG-UI /run_sse endpoint.
+// runSSEFunc returns the handler for the AG-UI /run_sse endpoint.
 //
 // The handler has two phases separated by the SSE commitment point:
 //   - Pre-SSE: request parsing, interceptors, validation.
 //     Errors in this phase return standard HTTP error responses.
 //   - Post-SSE: after SSE headers are written and RunStartedEvent is emitted.
 //     Errors in this phase are delivered as RunErrorEvent on the SSE stream.
-func (l *aguiLauncher) runSSEHandler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func (l *aguiLauncher) runSSEFunc() alismux.Func {
+	return func(w http.ResponseWriter, r *http.Request) error {
 		// Pre-SSE phase: errors use http.Error.
 
 		var req types.RunAgentInput
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			log.Printf("agui: error decoding request: %v", err)
 			http.Error(w, "Invalid AGUI request payload", http.StatusBadRequest)
-			return
+			return nil
 		}
 		defer r.Body.Close()
 
@@ -502,7 +532,7 @@ func (l *aguiLauncher) runSSEHandler() http.Handler {
 			ctx, err = interceptor.Before(ctx, callCtx, &req, r)
 			if err != nil {
 				http.Error(w, "Interceptor rejected request: "+err.Error(), http.StatusInternalServerError)
-				return
+				return nil
 			}
 			succeeded = i + 1
 		}
@@ -510,9 +540,19 @@ func (l *aguiLauncher) runSSEHandler() http.Handler {
 		// Interceptors may populate callCtx.User; validate it's set.
 		if callCtx == nil || callCtx.User == nil || callCtx.User.Name == "" {
 			http.Error(w, "userID is required", http.StatusBadRequest)
-			return
+			return nil
 		}
 		userID := callCtx.User.Name
+
+		// Upsert thread metadata after interceptors succeed and userID is
+		// validated, so rejected requests don't increment run_count.
+		// Re-extract identity from the post-interceptor context so it
+		// reflects any identity changes made by interceptors.
+		if l.config.threadService != nil && state.threadID != "" && userID != "" {
+			if iamIdentity, identityErr := iam.FromContext(ctx); identityErr == nil && iamIdentity != nil {
+				l.upsertThreadMetadata(ctx, iamIdentity, state.threadID, &req)
+			}
+		}
 
 		// Resume runs carry FunctionResponses instead of a new user text turn.
 		isResumeRun := len(req.Resume) > 0
@@ -528,7 +568,7 @@ func (l *aguiLauncher) runSSEHandler() http.Handler {
 		if err := rc.Flush(); err != nil {
 			handlerErr = fmt.Errorf("failed to flush SSE headers: %w", err)
 			http.Error(w, handlerErr.Error(), http.StatusInternalServerError)
-			return
+			return nil
 		}
 
 		e := newEmitter(ctx, w, sse.NewSSEWriter(), l.config.interceptors[:succeeded], callCtx)
@@ -550,20 +590,20 @@ func (l *aguiLauncher) runSSEHandler() http.Handler {
 		e.emit(events.NewRunStartedEvent(state.threadID, state.runID))
 		if e.err != nil {
 			handlerErr = fmt.Errorf("failed to write RunStartedEvent: %w", e.err)
-			return
+			return nil
 		}
 
 		// Load interrupts left open on a prior run for this thread (session id).
 		pending, err := l.loadPendingInterrupts(ctx, userID, sessionID)
 		if err != nil {
 			emitError(fmt.Errorf("failed to load pending interrupts: %w", err))
-			return
+			return nil
 		}
 
 		// Enforce AG-UI rules: pending threads require resume; cover all ids; schema/expiry.
 		if err := validateResumeAgainstPending(req.Resume, pending, time.Now()); err != nil {
 			emitError(err)
-			return
+			return nil
 		}
 
 		var reqState map[string]any
@@ -579,7 +619,7 @@ func (l *aguiLauncher) runSSEHandler() http.Handler {
 		snapSess, snapErr := l.ensureSessionForSnapshot(ctx, userID, sessionID, reqState)
 		if snapErr != nil {
 			emitError(fmt.Errorf("failed to prepare session for state snapshot: %w", snapErr))
-			return
+			return nil
 		}
 		emitStateSnapshotIfNonEmpty(e, buildStateSnapshot(snapSess, reqState))
 		// TODO(messages-snapshot-run-start): AG-UI recommends MESSAGES_SNAPSHOT when
@@ -597,13 +637,13 @@ func (l *aguiLauncher) runSSEHandler() http.Handler {
 			msg, err = resumeEntriesToConfirmationContent(req.Resume)
 			if err != nil {
 				emitError(fmt.Errorf("invalid resume payload: %w", err))
-				return
+				return nil
 			}
 		} else {
 			msg, err = extractLastUserMessage(req.Messages)
 			if err != nil {
 				emitError(err)
-				return
+				return nil
 			}
 		}
 
@@ -622,7 +662,7 @@ func (l *aguiLauncher) runSSEHandler() http.Handler {
 		_, adkEvents, err := l.runtime.RunSSE(ctx, runReq)
 		if err != nil {
 			emitError(err)
-			return
+			return nil
 		}
 
 		for ev, err := range adkEvents {
@@ -681,5 +721,6 @@ func (l *aguiLauncher) runSSEHandler() http.Handler {
 				handlerErr = err
 			}
 		}
-	})
+		return nil
+	}
 }
